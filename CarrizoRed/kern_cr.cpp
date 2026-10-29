@@ -46,10 +46,22 @@
 // reported success and changed nothing, yet a direct write landed). So routeChecked builds the trampoline itself, in
 // its own pool, has Lilu write only the jump (no wrapper, so no trampoline), and reads the jump back.
 static constexpr size_t RoutePoolSize = 16384;
+#ifdef __ELF__
+static uint8_t routePool[RoutePoolSize] __attribute__((section(".text"), aligned(16)));
+#else
 static uint8_t routePool[RoutePoolSize] __attribute__((section("__TEXT,__text"), aligned(16)));
+#endif
 static size_t routePoolUsed;
 static uint32_t routesOk, routesFailed, routesUnverified;
 static const char *routeLastFailed;
+struct SavedRouteJump {
+	mach_vm_address_t func;
+	mach_vm_address_t to;
+	const char *symbol;
+};
+static SavedRouteJump savedRouteJumps[256];
+static uint32_t savedRouteJumpCount;
+static uint32_t savedRouteRestores;
 
 // HWLibs functions by signature (kern_sigs.hpp) where the symbol is missing: builds before Sequoia ship HWLibs
 // stripped. Each signature is searched once per load address; the occurrence-th match is the function.
@@ -245,6 +257,8 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			routeLastFailed = request.symbol;
 			return false;
 		}
+		if (savedRouteJumpCount < 256)
+			savedRouteJumps[savedRouteJumpCount++] = {func, request.to, request.symbol};
 		routesOk++;
 		return true;
 	}
@@ -353,6 +367,49 @@ static void checkLiveHwlibs(void *hardware);
 // (context register indices 0x1D4-0x1DF) and set SX_BLEND_OPT_CONTROL (0x1D6) to every MRT's colour and alpha
 // optimisation off plus PIXEN_ZERO_OPT_DISABLE (0xB3333333). -crnorbplusfix only records.
 static bool rbplusDone;
+static uint32_t crVramMbOverride, crFbOffsetOverride;
+static void *savedCailPtr;
+static void *savedTptMgr, *savedVmm, *savedVmmPtr20, *savedVmmPtr28, *savedSdmaEngine, *savedSdmaChannel, *savedVmCtx;
+static void *savedRootVmm, *savedRootVmmPtr20, *savedRootVmmPtr28, *savedRootVmmPtr30, *savedRootVmmPtr38;
+static uint32_t commitPtGartCalls, commitPtVmCalls, commitPtVmFails;
+static uint64_t commitPtLastVa, commitPtMinVa, commitPtMaxVa;
+static uint32_t commitPtLastFlags, commitPtLastMemFlags;
+static uint32_t vmmSdmaRepaired, vmCtxSdmaRepaired;
+static uint32_t endVmptCalls, endVmptNulls;
+
+static void flushDiskLogNow();
+static void ensureVmmAndCtxSdma(void *vmm, void *ctx, const char *when);
+static void onInitializeHWEnginesDone();
+static void onAccelStartDone();
+
+static void verifyAllRouteJumps(const char *when) {
+	uint32_t count = savedRouteJumpCount;
+	for (uint32_t i = 0; i < count; i++) {
+		auto *entry = reinterpret_cast<volatile uint8_t *>(savedRouteJumps[i].func);
+		if (!entry)
+			continue;
+		if (entry[0] != 0xFF || entry[1] != 0x25) {
+			uint8_t b0 = entry[0], b1 = entry[1];
+			if (MachInfo::setKernelWriting(true, nullptr) == KERN_SUCCESS) {
+				static const uint8_t jmpRip[6] {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+				memcpy(const_cast<uint8_t *>(entry), jmpRip, sizeof(jmpRip));
+				memcpy(const_cast<uint8_t *>(entry) + 6, &savedRouteJumps[i].to, sizeof(savedRouteJumps[i].to));
+				MachInfo::setKernelWriting(false, nullptr);
+				savedRouteRestores++;
+				traceNote("rejump:%s@%s(%02x%02x) ", savedRouteJumps[i].symbol, when, b0, b1);
+			}
+		}
+	}
+}
+
+static inline uint32_t effectiveFbOffset(volatile uint32_t *mmio) {
+	return crFbOffsetOverride ? crFbOffsetOverride : (mmio ? (mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) : 0);
+}
+
+// Preserved boot backlight values for internal eDP panel
+static uint32_t bootBacklightPwrSeq = 0x30311;
+static uint32_t bootBacklightPwm = 0xC00032C8;
+
 // Every context register the clear-state buffer sets (what a context starts with before Metal sets anything), for the
 // one-time context dump (censusLog).
 static uint32_t csbCtx[0x400], csbCtxSet[0x400 / 32];
@@ -373,7 +430,7 @@ static void fixRbPlus(volatile uint32_t *mmio, bool stoney) {
 	uint64_t fbTop = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
 	if (mc < fbBase || mc + dwords * 4 > fbTop)
 		return;
-	uint64_t phys = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + (mc - fbBase);
+	uint64_t phys = (static_cast<uint64_t>(effectiveFbOffset(mmio)) << 22) + (mc - fbBase);
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, dwords * 4, kIODirectionInOut);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	if (map) {
@@ -626,6 +683,7 @@ static const char *pathPolarisController[] {
 	"/System/Library/Extensions/AMD9500Controller.kext/Contents/MacOS/AMD9500Controller"};
 static const char *pathSupport[] {"/System/Library/Extensions/AMDSupport.kext/Contents/MacOS/AMDSupport"};
 static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer.kext/Contents/MacOS/AMDFramebuffer"};
+static const char *pathIOAcceleratorFamily2[] {"/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2"};
 static const char *pathAgpm[] {
 	"/System/Library/Extensions/AppleGraphicsPowerManagement.kext/Contents/MacOS/AppleGraphicsPowerManagement"};
 static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy"};
@@ -640,6 +698,7 @@ enum KextIndex : size_t {
 	KextPolarisController,
 	KextSupport,
 	KextFramebuffer,
+	KextIOAcceleratorFamily2,
 	KextAgpm,
 	KextAgdp,
 	KextPci,
@@ -665,6 +724,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 		KernelPatcher::KextInfo::Unloaded},
 	[KextFramebuffer] = {"com.apple.kext.AMDFramebuffer", pathFramebuffer, arrsize(pathFramebuffer), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
+	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
+		arrsize(pathIOAcceleratorFamily2), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextAgpm] = {"com.apple.driver.AGPM", pathAgpm, arrsize(pathAgpm), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextAgdp] = {"com.apple.driver.AppleGraphicsDevicePolicy", pathAgdp, arrsize(pathAgdp), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
@@ -1123,6 +1184,7 @@ void CRDriver::findByConfigSpace() {
 	iterator->release();
 }
 
+static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 static mach_vm_address_t orgConfigureDevice;
 static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci);
 static mach_vm_address_t orgVideoContextStart, videoGetHWInfoOrg;
@@ -1187,6 +1249,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		}
 		else if (i == KextFramebuffer)
 			traceFramebuffer(patcher, index, slide, size);
+		else if (i == KextIOAcceleratorFamily2)
+			patchIOAccelerator(patcher, index, slide, size);
 		else if (i == KextAgpm) {
 			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
 			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
@@ -1733,6 +1797,29 @@ static bool diskLogAppend(const char *text, size_t len) {
 	}
 	diskLogWrites++;
 	return true;
+}
+
+static void flushDiskLogNow() {
+	if (diskLogOff)
+		return;
+	static char events[sizeof(diskLogEvents)];
+	uint32_t eventLen = 0;
+	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+	if (diskLogEventLen) {
+		memcpy(events, diskLogEvents, diskLogEventLen);
+		eventLen = diskLogEventLen;
+	}
+	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	if (eventLen && diskLogAppend(events, eventLen)) {
+		diskLogStarted = true;
+		while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+			__builtin_ia32_pause();
+		memmove(diskLogEvents, diskLogEvents + eventLen, diskLogEventLen - eventLen);
+		diskLogEventLen -= eventLen;
+		diskLogEvents[diskLogEventLen] = 0;
+		__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	}
 }
 
 static uint32_t hookCallCount();
@@ -2669,9 +2756,20 @@ namespace {
 			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 			return 0;
 		}
+		if (!strcmp(stages[N].name, "setBacklight") || !strcmp(stages[N].name, "atom.transmitter") || !strcmp(stages[N].name, "turnOnDigon")) {
+			if (gpuMmio) {
+				if ((gpuMmio[0x481B] & 0x10000) == 0)
+					gpuMmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : (gpuMmio[0x481B] | 0x10000);
+			}
+		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
+		if (!strcmp(stages[N].name, "hw.initializeHWEngines"))
+			onInitializeHWEnginesDone();
+		if (!strcmp(stages[N].name, "accel.start"))
+			onAccelStartDone();
+		verifyAllRouteJumps(stages[N].name);
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
@@ -2884,7 +2982,7 @@ static T vfunc(void *object, size_t offset) {
 static bool vmFixInit() {
 	if (vmFixReady || !vmFixOn || !gpuMmio)
 		return vmFixReady;
-	uint32_t location = gpuMmio[0x809], offset = gpuMmio[0x81A];  // MC_VM_FB_LOCATION, MC_VM_FB_OFFSET
+	uint32_t location = gpuMmio[0x809], offset = effectiveFbOffset(gpuMmio);  // MC_VM_FB_LOCATION, MC_VM_FB_OFFSET
 	vmFbStart = static_cast<uint64_t>(location & 0xFFFF) << 24;
 	vmFbEnd = static_cast<uint64_t>((location >> 16) & 0xFFFF) << 24 | 0xFFFFFF;
 	vmCarveout = static_cast<uint64_t>(offset & 0x3FFFF) << 22;
@@ -2924,20 +3022,308 @@ static const char *accelGuardMissLast;
 // 14.8.9 and 15.8.1 (checked where it's routed): drop the update count at +0x3C and, at 0, have the channel flush
 // (vtable +0x140 ready?, +0x158, then +0x160 with 0). Its first 14 bytes hold a branch target, so it can't be wrapped;
 // this copy runs instead, and a null channel panics with the report. -crnovmmcheck leaves Apple's.
+static void onInitializeHWEnginesDone() {
+	if (accelHardware) {
+		auto *hwBytes = static_cast<uint8_t *>(accelHardware);
+		savedVmm = *reinterpret_cast<void **>(hwBytes + 0x450);
+		savedTptMgr = *reinterpret_cast<void **>(hwBytes + 0x458);
+		if (accelSdma1Dropped) {
+			void *sdma0 = *reinterpret_cast<void **>(hwBytes + hwEngines + 8);
+			if (sdma0) {
+				savedSdmaEngine = sdma0;
+				*reinterpret_cast<void **>(hwBytes + hwEngines + 0x10) = sdma0;
+				diskLogEvent("hw.initializeHWEngines: aliased hw+%x (sDMA1) -> sDMA0 (%p), vmm=%p, tpt=%p",
+					hwEngines + 0x10, sdma0, savedVmm, savedTptMgr);
+			}
+		}
+	}
+}
+
+static void onAccelStartDone() {
+	if (accelHardware) {
+		auto *hwBytes = static_cast<uint8_t *>(accelHardware);
+		const auto *hwq = reinterpret_cast<const uint64_t *>(hwBytes + 0x430);
+		savedRootVmm = *reinterpret_cast<void **>(hwBytes + 0x450);
+		savedTptMgr = *reinterpret_cast<void **>(hwBytes + 0x458);
+		savedVmm = savedRootVmm;
+		diskLogEvent("hw@accel.start (+0x430..+0x478): [430]=%llx [438]=%llx [440]=%llx [448]=%llx [450]=%llx [458]=%llx [460]=%llx [468]=%llx [470]=%llx [478]=%llx",
+			hwq[0], hwq[1], hwq[2], hwq[3], hwq[4], hwq[5], hwq[6], hwq[7], hwq[8], hwq[9]);
+		if (savedRootVmm) {
+			const auto *vq = static_cast<const uint64_t *>(savedRootVmm);
+			savedRootVmmPtr20 = reinterpret_cast<void *>(vq[4]);
+			savedRootVmmPtr28 = reinterpret_cast<void *>(vq[5]);
+			savedRootVmmPtr30 = reinterpret_cast<void *>(vq[6]);
+			savedRootVmmPtr38 = reinterpret_cast<void *>(vq[7]);
+			savedVmmPtr20 = savedRootVmmPtr20;
+			savedVmmPtr28 = savedRootVmmPtr28;
+			diskLogEvent("vmm@accel.start (%p, tpt=%p): [0]=%llx [2/+10]=%llx [3/+18]=%llx [4/+20]=%llx [5/+28]=%llx [6/+30]=%llx [7/+38]=%llx [8/+40]=%llx",
+				savedRootVmm, savedTptMgr, vq[0], vq[2], vq[3], vq[4], vq[5], vq[6], vq[7], vq[8]);
+		}
+	}
+}
+
+static void ensureVmmAndCtxSdma(void *vmm, void *ctx, const char *when) {
+	(void)ctx;
+	if (vmm && vmm != savedTptMgr) {
+		savedVmm = vmm;
+		auto *vb = static_cast<uint8_t *>(vmm);
+		void **p18 = reinterpret_cast<void **>(vb + 0x18);
+		void **p20 = reinterpret_cast<void **>(vb + 0x20);
+		void **p28 = reinterpret_cast<void **>(vb + 0x28);
+		void **p30 = reinterpret_cast<void **>(vb + 0x30);
+		void **p38 = reinterpret_cast<void **>(vb + 0x38);
+		bool rep = false;
+		if (!*p18 && savedTptMgr) { *p18 = savedTptMgr; rep = true; }
+		if (!*p20 && savedRootVmmPtr20) { *p20 = savedRootVmmPtr20; rep = true; }
+		if (!*p28 && savedRootVmmPtr28) { *p28 = savedRootVmmPtr28; rep = true; }
+		if (!*p30 && savedRootVmmPtr30) { *p30 = savedRootVmmPtr30; rep = true; }
+		if (!*p38 && savedRootVmmPtr38) { *p38 = savedRootVmmPtr38; rep = true; }
+		if (rep) {
+			vmmSdmaRepaired++;
+			diskLogEvent("ensureVmmAndCtxSdma@%s: repaired vmm=%p (+18=%p +20=%p +28=%p +30=%p +38=%p)",
+				when, vmm, *p18, *p20, *p28, *p30, *p38);
+		}
+		savedVmmPtr20 = *p20 ? *p20 : savedRootVmmPtr20;
+		savedVmmPtr28 = *p28 ? *p28 : savedRootVmmPtr28;
+	}
+}
+
+static mach_vm_address_t orgCommitIntoGPUPageTable;
+static mach_vm_address_t orgReleaseFromGPUPageTable;
+
+static uint64_t wrapCommitIntoGPUPageTable(void *that) {
+	commitPtVmCalls++;
+	auto *self = static_cast<uint8_t *>(that);
+	void *vmCtx = self ? *reinterpret_cast<void **>(self + 0x88) : nullptr;
+	uint64_t gpuVA = self ? *reinterpret_cast<uint64_t *>(self + 0x98) : 0;
+	if (vmCtx) {
+		savedVmCtx = vmCtx;
+		auto *ctxBytes = static_cast<uint8_t *>(vmCtx);
+		commitPtMinVa = *reinterpret_cast<uint64_t *>(ctxBytes + 0x80);
+		commitPtMaxVa = *reinterpret_cast<uint64_t *>(ctxBytes + 0x88);
+		void *vmm = *reinterpret_cast<void **>(ctxBytes + 0x18);
+		if (vmm && vmm != savedTptMgr) {
+			savedVmm = vmm;
+			ensureVmmAndCtxSdma(vmm, vmCtx, "commitIntoGPUPageTable");
+		}
+	}
+	uint64_t ret = FunctionCast(wrapCommitIntoGPUPageTable, orgCommitIntoGPUPageTable)(that);
+	return ret;
+}
+
+static uint64_t wrapReleaseFromGPUPageTable(void *that) {
+	if (!that)
+		return 0;
+	auto *self = static_cast<uint8_t *>(that);
+	void *task = *reinterpret_cast<void **>(self + 0x90);
+	uint8_t hasVM = task ? *reinterpret_cast<uint8_t *>(static_cast<uint8_t *>(task) + 0x268) : 0;
+	void *vmCtx = (task && hasVM == 1) ? *reinterpret_cast<void **>(static_cast<uint8_t *>(task) + 0x260) : nullptr;
+	uint64_t gpuVA = *reinterpret_cast<uint64_t *>(self + 0x98);
+	static uint32_t releaseCalls;
+	uint32_t relNum = ++releaseCalls;
+	if (relNum <= 16) {
+		diskLogEvent("releaseFromGPUPageTable #%u (%p): va=0x%llx task=%p hasVM=%u vmCtx=%p",
+			relNum, that, gpuVA, task, hasVM, vmCtx);
+		flushDiskLogNow();
+	}
+	uint64_t ret = FunctionCast(wrapReleaseFromGPUPageTable, orgReleaseFromGPUPageTable)(that);
+	return ret;
+}
+
 static uint64_t wrapEndVMPTUpdate(void *that) {
+	uint32_t callNum = ++endVmptCalls;
+	if (!that)
+		return 0;
+	if (that != savedTptMgr) {
+		savedVmm = that;
+		ensureVmmAndCtxSdma(that, nullptr, "endVMPTUpdate");
+	}
 	auto *self = static_cast<uint8_t *>(that);
 	auto &count = *reinterpret_cast<int32_t *>(self + 0x3C);
+	int32_t prev3c = count;
 	if (--count != 0)
 		return 0;
 	auto *channel = *reinterpret_cast<void **>(self + 0x28);
-	if (!channel)
-		CRDriver::vmmPanic(that);
-	if (!vfunc<uint32_t (*)(void *)>(channel, 0x140)(channel))
+	if (!channel && savedRootVmmPtr28) {
+		channel = savedRootVmmPtr28;
+		*reinterpret_cast<void **>(self + 0x28) = savedRootVmmPtr28;
+	}
+	if (!channel) {
+		uint32_t nullNum = ++endVmptNulls;
+		if (nullNum <= 4)
+			traceNote("endVMPT=null28(%u) ", nullNum);
+		if (checkKernelArgument("-crvmmpanic"))
+			CRDriver::vmmPanic(that);
+		return 0;
+	}
+	savedVmmPtr28 = channel;
+	uint32_t ok140 = vfunc<uint32_t (*)(void *)>(channel, 0x140)(channel);
+	if (!ok140)
 		return 0;
 	vfunc<void (*)(void *)>(channel, 0x158)(channel);
 	channel = *reinterpret_cast<void **>(self + 0x28);
-	return vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
+	uint64_t ret = vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
+	if (callNum <= 8) {
+		diskLogEvent("endVMPTUpdate #%u ok: vmm=%p +0x28=%p cnt3c=%d->%d ok140=%u ret=%llx",
+			callNum, that, channel, prev3c, count, ok140, ret);
+		flushDiskLogNow();
+	}
+	return ret;
 }
+
+static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t arg) {
+	static uint32_t zeroCalls;
+	uint32_t zNum = ++zeroCalls;
+	if (zNum <= 32) {
+		diskLogEvent("zeroVidMemory #%u: that=%p event=%p arg=0x%llx -> ok (bypassed)",
+			zNum, that, event, arg);
+		flushDiskLogNow();
+	}
+	return 0;
+}
+
+static uint64_t wrapPageon(void *that, void *event, bool flag, uint64_t arg) {
+	static uint32_t pageonCalls;
+	uint32_t pNum = ++pageonCalls;
+	if (pNum <= 32) {
+		diskLogEvent("pageon #%u: that=%p event=%p flag=%d arg=0x%llx -> ok (bypassed)",
+			pNum, that, event, flag, arg);
+		flushDiskLogNow();
+	}
+	return 0;
+}
+
+static uint64_t wrapPageoff(void *that, void *event, bool flag, uint64_t arg) {
+	static uint32_t pageoffCalls;
+	uint32_t pNum = ++pageoffCalls;
+	if (pNum <= 32) {
+		diskLogEvent("pageoff #%u: that=%p event=%p flag=%d arg=0x%llx -> ok (bypassed)",
+			pNum, that, event, flag, arg);
+		flushDiskLogNow();
+	}
+	return 0;
+}
+
+static uint64_t wrapInitFillRegions(void *that) {
+	static uint32_t fillCalls;
+	uint32_t fNum = ++fillCalls;
+	if (fNum <= 32) {
+		diskLogEvent("initFillRegions #%u: that=%p -> ok (bypassed)", fNum, that);
+		flushDiskLogNow();
+	}
+	return 0;
+}
+
+static uint64_t wrapResourcePrepare(void *that) {
+	static uint32_t prepCalls;
+	uint32_t pNum = ++prepCalls;
+	if (pNum <= 32) {
+		diskLogEvent("resource::prepare #%u: that=%p -> ok (bypassed)", pNum, that);
+		flushDiskLogNow();
+	}
+	return 1;
+}
+
+static mach_vm_address_t orgAssignVMID;
+static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *channel, void **event, bool *pBool) {
+	static uint32_t assignCalls;
+	uint32_t aNum = ++assignCalls;
+	if (that)
+		ensureVmmAndCtxSdma(that, ctx, "assignVMID");
+
+	auto *vb = static_cast<uint8_t *>(that);
+	void *p18 = that ? *reinterpret_cast<void **>(vb + 0x18) : nullptr;
+	void *p20 = that ? *reinterpret_cast<void **>(vb + 0x20) : nullptr;
+	void *p28 = that ? *reinterpret_cast<void **>(vb + 0x28) : nullptr;
+	void *p30 = that ? *reinterpret_cast<void **>(vb + 0x30) : nullptr;
+
+	bool isApu = !checkKernelArgument("-crorgassign");
+
+	// On discrete GPU or if -crorgassign is specified and all pointers are populated, call original
+	if (!isApu && p18 && p20 && p28 && p30 && orgAssignVMID) {
+		uint64_t ret = FunctionCast(wrapAssignVMID, orgAssignVMID)(that, ctx, vmid, channel, event, pBool);
+		if (aNum <= 32) {
+			diskLogEvent("assignVMID #%u (org): ret=%llu vmid=%u switch=%d",
+				aNum, ret, vmid, pBool ? *pBool : -1);
+			flushDiskLogNow();
+		}
+		return ret;
+	}
+
+	// Safe APU VMID assignment:
+	// 1. Determine the channel's engine index (0 for GFX)
+	void *ring = channel ? vfunc<void *(*)(void *)>(channel, 0x218)(channel) : nullptr;
+	uint32_t engine = ring ? vfunc<uint32_t (*)(void *)>(ring, 0x138)(ring) : 0;
+
+	// 2. Look up the VMID already assigned to this context for this engine
+	uint32_t *ctxVmids = ctx ? reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ctx) + 0x118) : nullptr;
+	uint32_t curVmid = ctxVmids ? ctxVmids[engine] : 0;
+	bool newlyAssigned = false;
+
+	if (curVmid == 0 && that) {
+		curVmid = vfunc<uint32_t (*)(void *, uint32_t, void *)>(that, 0x170)(that, engine, ctx);
+		if (curVmid == 0)
+			curVmid = 1;
+		if (ctxVmids)
+			ctxVmids[engine] = curVmid;
+		newlyAssigned = true;
+
+		uint8_t *vmmTable = vb + 0x88 + engine * 0x500 + curVmid * 0x50;
+		*reinterpret_cast<void **>(vmmTable) = ctx;
+
+		uint32_t *pSeq = reinterpret_cast<uint32_t *>(vb + 0xa90);
+		uint32_t seq = ++(*pSeq);
+		*reinterpret_cast<uint32_t *>(vmmTable + 0x48) = seq;
+	}
+
+	vmid = curVmid ? curVmid : 1;
+
+	// 3. Provide valid event pointer to callers
+	if (event && that) {
+		uint8_t *vmmTable = vb + 0x88 + engine * 0x500 + vmid * 0x50;
+		*event = vmmTable + 8;
+	} else if (event) {
+		*event = nullptr;
+	}
+
+	// 4. Program Page Directory Base (PDB) into hardware registers when newly assigned
+	if (newlyAssigned && that && ctx) {
+		void *tptMgr = *reinterpret_cast<void **>(vb + 0x18);
+		if (!tptMgr && savedTptMgr) {
+			tptMgr = savedTptMgr;
+			*reinterpret_cast<void **>(vb + 0x18) = savedTptMgr;
+		}
+		if (tptMgr) {
+			uint64_t pdb = vfunc<uint64_t (*)(void *)>(ctx, 0x158)(ctx);
+			vfunc<uint64_t (*)(void *, uint64_t)>(tptMgr, 0x200)(tptMgr, pdb);
+			if (aNum <= 32) {
+				diskLogEvent("assignVMID #%u: programmed PDB=0x%llx for vmid=%u via tptMgr=%p",
+					aNum, pdb, vmid, tptMgr);
+			}
+		}
+		if (gpuMmio) {
+			gpuMmio[0x546] = (1U << vmid);
+		}
+	}
+
+	// 5. Notify context that VMID is assigned
+	if (ctx) {
+		vfunc<void (*)(void *, uint32_t)>(ctx, 0x170)(ctx, engine);
+	}
+
+	// 6. Set switch flag if requested
+	if (pBool)
+		*pBool = newlyAssigned;
+
+	if (aNum <= 32) {
+		diskLogEvent("assignVMID #%u (APU safe): vmm=%p ctx=%p ch=%p eng=%u vmid=%u new=%d",
+			aNum, that, ctx, channel, engine, vmid, newlyAssigned);
+		flushDiskLogNow();
+	}
+	return 1;
+}
+
+static mach_vm_address_t orgZeroVidMemory, orgPageon, orgPageoff, orgInitFillRegions, orgResourcePrepare;
 static bool wrapPowerUpHWEngines(void *that);
 
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
@@ -3143,6 +3529,30 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
 			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
 	}
+	route("__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
+		reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory), orgZeroVidMemory, nullptr, 0,
+		"zeroVidMemory");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource6pageonEP12IOAccelEventby",
+		reinterpret_cast<mach_vm_address_t>(wrapPageon), orgPageon, nullptr, 0,
+		"pageon");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource7pageoffEP12IOAccelEventby",
+		reinterpret_cast<mach_vm_address_t>(wrapPageoff), orgPageoff, nullptr, 0,
+		"pageoff");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
+		reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions), orgInitFillRegions, nullptr, 0,
+		"initFillRegions");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource7prepareEv",
+		reinterpret_cast<mach_vm_address_t>(wrapResourcePrepare), orgResourcePrepare, nullptr, 0,
+		"resourcePrepare");
+	route("__ZN23AMDRadeonX4000_AMDHWVMM10assignVMIDEP30AMDRadeonX4000_IAMDHWVMContextRjP30AMDRadeonX4000_AMDAccelChannelPP12IOAccelEventPb",
+		reinterpret_cast<mach_vm_address_t>(wrapAssignVMID), orgAssignVMID, nullptr, 0,
+		"assignVMID");
+	route("__ZN32AMDRadeonX4000_AMDAccelMemoryMap22commitIntoGPUPageTableEv",
+		reinterpret_cast<mach_vm_address_t>(wrapCommitIntoGPUPageTable), orgCommitIntoGPUPageTable, nullptr, 0,
+		"commitIntoGPUPageTable");
+	route("__ZN32AMDRadeonX4000_AMDAccelMemoryMap23releaseFromGPUPageTableEv",
+		reinterpret_cast<mach_vm_address_t>(wrapReleaseFromGPUPageTable), orgReleaseFromGPUPageTable, nullptr, 0,
+		"releaseFromGPUPageTable");
 }
 
 bool CRDriver::wrapAllocateHWEngines(void *that) {
@@ -5143,7 +5553,11 @@ uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
 	int flags = regAccess(RegRead, offset, 1, 0);
 	if (flags & RegBlocked)
 		return 0;
-	return regReadDone(flags, FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset));
+	uint32_t val = FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
+	uint32_t dword = offset >> 2;
+	if (dword == Reg::CONFIG_MEMSIZE && crVramMbOverride)
+		val = (val & ~0xFFFF) | (crVramMbOverride & 0xFFFF);
+	return regReadDone(flags, val);
 }
 
 uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
@@ -5174,7 +5588,11 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 	int flags = regAccess(RegRead, offset, 0, 0);
 	if (flags & RegBlocked)
 		return 0;
-	return regReadDone(flags, FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset));
+	uint32_t val = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
+	uint32_t dword = offset >> 2;
+	if (dword == Reg::CONFIG_MEMSIZE && crVramMbOverride)
+		val = (val & ~0xFFFF) | (crVramMbOverride & 0xFFFF);
+	return regReadDone(flags, val);
 }
 
 // Line buffer size. LB_MEMORY_CTRL (pipe 0 at dword 0x1AC1, +0x200 per pipe on DCE 11.0): Apple writes
@@ -5708,6 +6126,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	// 25-27 had this patch writing bits [1:0] by mistake: coherent + reserved, clock still P1PLL). Apply both for DP
 	// modes (0 SST, 5 MST), keep Apple's HPD. -crnodpextclk disables.
 	uint8_t patched = 0;
+	if (table == AtomTransmitterTable && gpuMmio) {
+		if ((gpuMmio[0x481B] & 0x10000) == 0)
+			gpuMmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : (gpuMmio[0x481B] | 0x10000);
+	}
 	if (table == AtomTransmitterTable && params && !dpExtClkOff) {
 		auto *bytes = static_cast<uint8_t *>(params);
 		if (bytes[6] == 0 || bytes[6] == 5) {
@@ -6120,6 +6542,40 @@ void CRDriver::ensureMmio() {
 		callback->probeMMIO();
 }
 
+
+static mach_vm_address_t orgMergeEvent;
+static void wrapMergeEvent(void *that, void *dst, void *src) {
+	static uint32_t mergeCalls;
+	uint32_t mNum = ++mergeCalls;
+	if (mNum <= 32) {
+		diskLogEvent("mergeEvent #%u: that=%p dst=%p src=%p", mNum, that, dst, src);
+		flushDiskLogNow();
+	}
+	uintptr_t srcVal = reinterpret_cast<uintptr_t>(src);
+	if (srcVal <= 0x1000) {
+		diskLogEvent("mergeEvent #%u: guarded invalid pointer (that=%p dst=%p src=%p)", mNum, that, dst, src);
+		flushDiskLogNow();
+		return;
+	}
+	FunctionCast(wrapMergeEvent, orgMergeEvent)(that, dst, src);
+}
+
+static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	KernelPatcher::RouteRequest request {
+		"__ZN25IOAccelEventMachineFast210mergeEventEP12IOAccelEventS1_",
+		wrapMergeEvent,
+		orgMergeEvent
+	};
+	if (patcher.routeMultipleLong(index, &request, 1, slide, size)) {
+		traceNote("accel_merge:ok ");
+		diskLogEvent("patchIOAccelerator: hooked mergeEvent successfully");
+	} else {
+		traceNote("accel_merge:err ");
+		diskLogEvent("patchIOAccelerator: failed to hook mergeEvent (err=%d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
 void CRDriver::probeMMIO() {
 	auto *mmio = mapGpuMmio(iGPU);
 	if (!mmio) {
@@ -6156,7 +6612,29 @@ void CRDriver::probeMMIO() {
 
 	uint64_t fbBase = static_cast<uint64_t>(fbLocation & 0xFFFF) << 24;
 	uint64_t fbTop = (static_cast<uint64_t>(fbLocation >> 16) << 24) | 0xFFFFFF;
-	uint64_t carveoutPhys = static_cast<uint64_t>(fbOffset) << 22;
+	uint64_t carveoutPhys = static_cast<uint64_t>(fbOffset & 0x3FFFF) << 22;
+
+	uint32_t expandMb = 0;
+	if (PE_parse_boot_argn("crvrammb", &expandMb, sizeof(expandMb))) {
+		if (expandMb >= 64 && expandMb <= 2048) {
+			memSize = expandMb;
+			crVramMbOverride = expandMb;
+			SYSLOG("cr", "overriding UMA VRAM size to %u MB from crvrammb boot-arg", memSize);
+		}
+	} else if (memSize < 256 && !checkKernelArgument("-crnoexpandvram")) {
+		memSize = 256;
+		crVramMbOverride = 256;
+		SYSLOG("cr", "auto-expanding UMA VRAM size to %u MB (BIOS allocated only %u MB)", memSize,
+			mmio[Reg::CONFIG_MEMSIZE] & 0xFFFF);
+	}
+
+	uint32_t fbOffsetOverride = 0;
+	if (PE_parse_boot_argn("crfboffset", &fbOffsetOverride, sizeof(fbOffsetOverride))) {
+		crFbOffsetOverride = fbOffsetOverride;
+		fbOffset = fbOffsetOverride;
+		carveoutPhys = static_cast<uint64_t>(fbOffset & 0x3FFFF) << 22;
+		SYSLOG("cr", "overriding UMA FB_OFFSET to 0x%05X (phys 0x%llX)", fbOffset, carveoutPhys);
+	}
 
 	SYSLOG("cr", "UMA carve-out %u MB at system 0x%llX, GPU FB range 0x%llX-0x%llX", memSize, carveoutPhys, fbBase,
 		fbTop);
@@ -6166,6 +6644,8 @@ void CRDriver::probeMMIO() {
 	iGPU->setProperty("CarrizoRed,vram-mb", memSize, 32);
 	iGPU->setProperty("CarrizoRed,carveout-phys", carveoutPhys, 64);
 	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
+	iGPU->setProperty("VRAM,totalMB", static_cast<unsigned long long>(memSize), 32);
+	iGPU->setProperty("ATY,memsize", static_cast<unsigned long long>(memSize) << 20, 64);
 
 	initDisplayRegs();
 	relocateFb();
