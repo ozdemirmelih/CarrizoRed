@@ -313,6 +313,10 @@ static uint64_t commitPtLastVa, commitPtMinVa, commitPtMaxVa;
 static uint32_t commitPtLastFlags, commitPtLastMemFlags;
 static uint32_t vmmSdmaRepaired, vmCtxSdmaRepaired;
 static uint32_t endVmptCalls, endVmptNulls;
+static mach_vm_address_t orgZeroVidMemory, orgPageon, orgPageoff, orgInitFillRegions, orgResourcePrepare;
+static mach_vm_address_t orgAddToPageTableUpdateBarrier, orgSetDMAUpdates, orgGetHWEngine;
+static uint32_t getHwEngAliased;
+
 
 static void flushDiskLogNow();
 static void ensureVmmAndCtxSdma(void *vmm, void *ctx, const char *when);
@@ -3089,6 +3093,28 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 	return ret;
 }
 
+static void *wrapGetHWEngine(void *that, uint32_t engine) {
+	void *eng = nullptr;
+	if (orgGetHWEngine)
+		eng = FunctionCast(wrapGetHWEngine, orgGetHWEngine)(that, engine);
+	else if (that && engine < 12)
+		eng = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x3B0 + 8 * engine);
+	if (!eng && engine == 2 && accelSdma1Dropped && that) {
+		eng = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x3B8);
+		if (!getHwEngAliased++)
+			traceNote("hweng2->1 ");
+	}
+	if ((engine == 1 || engine == 2) && eng)
+		savedSdmaEngine = eng;
+	static uint32_t getEngCalls;
+	uint32_t callNum = ++getEngCalls;
+	if (callNum <= 24) {
+		auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+		diskLogEvent("getHWEngine #%u(eng=%u) -> %p (caller=%p)", callNum, engine, eng, reinterpret_cast<void *>(caller));
+	}
+	return eng;
+}
+
 static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t arg) {
 	static uint32_t zeroCalls;
 	uint32_t zNum = ++zeroCalls;
@@ -3135,8 +3161,39 @@ static uint64_t wrapInitFillRegions(void *that) {
 static uint64_t wrapResourcePrepare(void *that) {
 	static uint32_t prepCalls;
 	uint32_t pNum = ++prepCalls;
+	uint64_t ret = 0;
+	if (orgResourcePrepare && that)
+		ret = FunctionCast(wrapResourcePrepare, orgResourcePrepare)(that);
 	if (pNum <= 32) {
-		diskLogEvent("resource::prepare #%u: that=%p -> ok (bypassed)", pNum, that);
+		diskLogEvent("resource::prepare #%u: that=%p -> ret=%llx", pNum, that, ret);
+		flushDiskLogNow();
+	}
+	return ret;
+}
+
+static void wrapAddToPageTableUpdateBarrier(void *that, void *event) {
+	static uint32_t barrierCalls;
+	uint32_t bNum = ++barrierCalls;
+	if (bNum <= 16) {
+		diskLogEvent("addToPageTableUpdateBarrier #%u: bypassed that=%p event=%p", bNum, that, event);
+		flushDiskLogNow();
+	}
+	return;
+}
+
+static uint64_t wrapSetDMAUpdates(void *that, void *eventMachine, void *cmdBufPool) {
+	static uint32_t setDmaCalls;
+	uint32_t num = ++setDmaCalls;
+	if (that) {
+		auto *ctx = static_cast<uint8_t *>(that);
+		if (eventMachine)
+			*reinterpret_cast<void **>(ctx + 0x30) = eventMachine;
+		if (cmdBufPool)
+			*reinterpret_cast<void **>(ctx + 0x38) = cmdBufPool;
+	}
+	if (num <= 16) {
+		diskLogEvent("setDMAUpdates #%u: ctx=%p evMach=%p pool=%p -> ok",
+			num, that, eventMachine, cmdBufPool);
 		flushDiskLogNow();
 	}
 	return 1;
@@ -3241,7 +3298,6 @@ static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *chan
 	return 1;
 }
 
-static mach_vm_address_t orgZeroVidMemory, orgPageon, orgPageoff, orgInitFillRegions, orgResourcePrepare;
 static bool wrapPowerUpHWEngines(void *that);
 
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
@@ -3419,6 +3475,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			version == KernelVersion::Catalina ? capsChecksCatalina :
 			version <= KernelVersion::Monterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
 	}
+		if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
+		route("__ZN26AMDRadeonX4000_AMDHardware11getHWEngineE20_eAMD_HW_ENGINE_TYPE",
+			reinterpret_cast<mach_vm_address_t>(wrapGetHWEngine), orgGetHWEngine, nullptr, 0, "getHWEngine");
+	}
 	if (!checkKernelArgument("-crnovmmcheck")) {
 		static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
 		const char *name = "__ZN23AMDRadeonX4000_AMDHWVMM13endVMPTUpdateEv";
@@ -3471,6 +3531,12 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	route("__ZN32AMDRadeonX4000_AMDAccelMemoryMap23releaseFromGPUPageTableEv",
 		reinterpret_cast<mach_vm_address_t>(wrapReleaseFromGPUPageTable), orgReleaseFromGPUPageTable, nullptr, 0,
 		"releaseFromGPUPageTable");
+	route("__ZN29AMDRadeonX4000_AMDHWVMContext27addToPageTableUpdateBarrierEP12IOAccelEvent",
+		reinterpret_cast<mach_vm_address_t>(wrapAddToPageTableUpdateBarrier), orgAddToPageTableUpdateBarrier, nullptr, 0,
+		"addToPageTableUpdateBarrier");
+	route("__ZN29AMDRadeonX4000_AMDHWVMContext13setDMAUpdatesEP20IOAccelEventMachine2P36AMDRadeonX4000_IAMDCommandBufferPool",
+		reinterpret_cast<mach_vm_address_t>(wrapSetDMAUpdates), orgSetDMAUpdates, nullptr, 0,
+		"setDMAUpdates");
 }
 
 bool CRDriver::wrapAllocateHWEngines(void *that) {
