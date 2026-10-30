@@ -1181,16 +1181,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
 			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
 		} else if (i == KextAgdp) {
-			if (checkKernelArgument("-crmacgpu"))
-				patchAgdpBoardId(patcher, i);
-			if (checkKernelArgument("-crnoagdp")) {
-				KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService",
-					wrapStartFail};
-				if (!routeChecked(patcher, index, request, slide, size)) {
-					SYSLOG("cr", "-crnoagdp: failed to route (error %d)", patcher.getError());
-					patcher.clearError();
-				}
-			}
+			// Neutralise AGDP board-id matching so all display outputs remain active without crashing solveSymbol
+			patchAgdpBoardId(patcher, i);
 		}
 		else if (i == KextRadeonX4000) {
 			blockProbe(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi",
