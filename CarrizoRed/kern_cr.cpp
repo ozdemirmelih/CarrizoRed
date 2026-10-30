@@ -193,6 +193,8 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			size_t len = Disassembler::hdeDisasm(func + at, &hs);
 			if (!len || (hs.flags & F_ERROR))
 				break;
+			if (hs.opcode == 0xC3 || hs.opcode == 0xC2)
+				break;
 			if (hs.flags & F_RELATIVE) {
 				int64_t disp = (hs.flags & F_IMM8) ? static_cast<int8_t>(hs.imm.imm8) : static_cast<int32_t>(hs.imm.imm32);
 				mach_vm_address_t target = func + at + len + disp;
@@ -683,7 +685,6 @@ static const char *pathPolarisController[] {
 	"/System/Library/Extensions/AMD9500Controller.kext/Contents/MacOS/AMD9500Controller"};
 static const char *pathSupport[] {"/System/Library/Extensions/AMDSupport.kext/Contents/MacOS/AMDSupport"};
 static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer.kext/Contents/MacOS/AMDFramebuffer"};
-static const char *pathIOAcceleratorFamily2[] {"/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2"};
 static const char *pathAgpm[] {
 	"/System/Library/Extensions/AppleGraphicsPowerManagement.kext/Contents/MacOS/AppleGraphicsPowerManagement"};
 static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy"};
@@ -698,7 +699,6 @@ enum KextIndex : size_t {
 	KextPolarisController,
 	KextSupport,
 	KextFramebuffer,
-	KextIOAcceleratorFamily2,
 	KextAgpm,
 	KextAgdp,
 	KextPci,
@@ -724,8 +724,6 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 		KernelPatcher::KextInfo::Unloaded},
 	[KextFramebuffer] = {"com.apple.kext.AMDFramebuffer", pathFramebuffer, arrsize(pathFramebuffer), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
-	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
-		arrsize(pathIOAcceleratorFamily2), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextAgpm] = {"com.apple.driver.AGPM", pathAgpm, arrsize(pathAgpm), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextAgdp] = {"com.apple.driver.AppleGraphicsDevicePolicy", pathAgdp, arrsize(pathAgdp), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
@@ -866,46 +864,47 @@ struct PagePatch {
 	uint32_t replaceSize;
 	bool enabled;
 	uint32_t hits;
+	int kernelVersion;
 };
 static PagePatch pagePatches[] {
-	{"isa", "-crnoscpatch", false, 0xD78, scPatchFind, sizeof(scPatchFind), 0x25, isaReplace, sizeof(isaReplace)},
+	{"isa", "-crnoscpatch", false, 0xD78, scPatchFind, sizeof(scPatchFind), 0x25, isaReplace, sizeof(isaReplace), false, 0, KernelVersion::Sequoia},
 	{"smallprim", "-crnosmallprim", false, 0x215, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
-		sizeof(smallPrimReplace)},
+		sizeof(smallPrimReplace), false, 0, KernelVersion::Sequoia},
 	{"walkfence", "-crnowalkfence", false, 0x4AA, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
-		sizeof(walkFenceReplace)},
-	{"dcc", "-crdcc", false, 0xA2C, dccFind, sizeof(dccFind), 0x17, dccReplace, sizeof(dccReplace)},
-	{"isa13", "-crnoscpatch", false, 0xD3A, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace)},
-	{"smallprim13", "-crnosmallprim", false, 0xA68, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
-		sizeof(smallPrimReplace)},
-	{"walkfence13", "-crnowalkfence", false, 0xCF0, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
-		sizeof(walkFenceReplace)},
-	{"dcc13", "-crdcc", false, 0x500, dccVenturaFind, sizeof(dccVenturaFind), 15, dccVenturaReplace,
-		sizeof(dccVenturaReplace)},
-	{"isa14", "-crnoscpatch", false, 0x4B6, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace)},
+		sizeof(walkFenceReplace), false, 0, KernelVersion::Sequoia},
+	{"dcc", "-crdcc", false, 0xA2C, dccFind, sizeof(dccFind), 0x17, dccReplace, sizeof(dccReplace), false, 0, KernelVersion::Sequoia},
+	{"isa14", "-crnoscpatch", false, 0x4B6, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace), false, 0, KernelVersion::Sonoma},
 	{"smallprim14", "-crnosmallprim", false, 0x65D, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
-		sizeof(smallPrimReplace)},
+		sizeof(smallPrimReplace), false, 0, KernelVersion::Sonoma},
 	{"walkfence14", "-crnowalkfence", false, 0x8F3, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
-		sizeof(walkFenceReplace)},
-	{"dcc14", "-crdcc", false, 0x60A, dccSonomaFind, sizeof(dccSonomaFind), 0x17, dccReplace, sizeof(dccReplace)},
-	{"isa12", "-crnoscpatch", false, 0xE1F, isaMontereyFind, sizeof(isaMontereyFind), 0x1A, isaReplace, sizeof(isaReplace)},
+		sizeof(walkFenceReplace), false, 0, KernelVersion::Sonoma},
+	{"dcc14", "-crdcc", false, 0x60A, dccSonomaFind, sizeof(dccSonomaFind), 0x17, dccReplace, sizeof(dccReplace), false, 0, KernelVersion::Sonoma},
+	{"isa13", "-crnoscpatch", false, 0xD3A, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace), false, 0, KernelVersion::Ventura},
+	{"smallprim13", "-crnosmallprim", false, 0xA68, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
+		sizeof(smallPrimReplace), false, 0, KernelVersion::Ventura},
+	{"walkfence13", "-crnowalkfence", false, 0xCF0, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
+		sizeof(walkFenceReplace), false, 0, KernelVersion::Ventura},
+	{"dcc13", "-crdcc", false, 0x500, dccVenturaFind, sizeof(dccVenturaFind), 15, dccVenturaReplace,
+		sizeof(dccVenturaReplace), false, 0, KernelVersion::Ventura},
+	{"isa12", "-crnoscpatch", false, 0xE1F, isaMontereyFind, sizeof(isaMontereyFind), 0x1A, isaReplace, sizeof(isaReplace), false, 0, KernelVersion::Monterey},
 	{"smallprim12", "-crnosmallprim", false, 0xF6A, smallPrimMontereyFind, sizeof(smallPrimMontereyFind), 14,
-		smallPrimReplace, sizeof(smallPrimReplace)},
+		smallPrimReplace, sizeof(smallPrimReplace), false, 0, KernelVersion::Monterey},
 	{"walkfence12", "-crnowalkfence", false, 0x1BB, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
-		walkFenceReplace, sizeof(walkFenceReplace)},
-	{"dcc12", "-crdcc", false, 0x50E, dccMontereyFind, sizeof(dccMontereyFind), 8, dccReplace, sizeof(dccReplace)},
-	{"isa11", "-crnoscpatch", false, 0x4AD, isaBigSurFind, sizeof(isaBigSurFind), 0x1F, isaReplace, sizeof(isaReplace)},
+		walkFenceReplace, sizeof(walkFenceReplace), false, 0, KernelVersion::Monterey},
+	{"dcc12", "-crdcc", false, 0x50E, dccMontereyFind, sizeof(dccMontereyFind), 8, dccReplace, sizeof(dccReplace), false, 0, KernelVersion::Monterey},
+	{"isa11", "-crnoscpatch", false, 0x4AD, isaBigSurFind, sizeof(isaBigSurFind), 0x1F, isaReplace, sizeof(isaReplace), false, 0, KernelVersion::BigSur},
 	{"smallprim11", "-crnosmallprim", false, 0x93F, smallPrimBigSurFind, sizeof(smallPrimBigSurFind), 14,
-		smallPrimReplace, sizeof(smallPrimReplace)},
+		smallPrimReplace, sizeof(smallPrimReplace), false, 0, KernelVersion::BigSur},
 	{"walkfence11", "-crnowalkfence", false, 0xB8F, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
-		walkFenceReplace, sizeof(walkFenceReplace)},
-	{"dcc11", "-crdcc", false, 0xF4F, dccBigSurFind, sizeof(dccBigSurFind), 4, dccReplace, sizeof(dccReplace)},
+		walkFenceReplace, sizeof(walkFenceReplace), false, 0, KernelVersion::BigSur},
+	{"dcc11", "-crdcc", false, 0xF4F, dccBigSurFind, sizeof(dccBigSurFind), 4, dccReplace, sizeof(dccReplace), false, 0, KernelVersion::BigSur},
 	{"isa10", "-crnoscpatch", false, 0x758, isaCatalinaFind, sizeof(isaCatalinaFind), 4, isaCatalinaReplace,
-		sizeof(isaCatalinaReplace)},
+		sizeof(isaCatalinaReplace), false, 0, KernelVersion::Catalina},
 	{"smallprim10", "-crnosmallprim", false, 0x21A, smallPrimCatalinaFind, sizeof(smallPrimCatalinaFind), 14,
-		smallPrimReplace, sizeof(smallPrimReplace)},
+		smallPrimReplace, sizeof(smallPrimReplace), false, 0, KernelVersion::Catalina},
 	{"walkfence10", "-crnowalkfence", false, 0x472, walkFenceCatalinaFind, sizeof(walkFenceCatalinaFind), 2,
-		walkFenceReplace, sizeof(walkFenceReplace)},
-	{"dcc10", "-crdcc", false, 0xAD9, dccCatalinaFind, sizeof(dccCatalinaFind), 13, dccReplace, sizeof(dccReplace)},
+		walkFenceReplace, sizeof(walkFenceReplace), false, 0, KernelVersion::Catalina},
+	{"dcc10", "-crdcc", false, 0xAD9, dccCatalinaFind, sizeof(dccCatalinaFind), 13, dccReplace, sizeof(dccReplace), false, 0, KernelVersion::Catalina},
 };
 static mach_vm_address_t orgCsValidatePage, orgCsValidateRange;
 static bool scPatchHooked;
@@ -932,7 +931,7 @@ static bool isSharedCacheVnode(void *vnode) {
 	for (auto &e : seen)
 		if (e.vnode == vnode)
 			return e.cache;
-	char path[160];
+	char path[1024];
 	int len = sizeof(path);
 	bool cache = vn_getpath(static_cast<vnode_t>(vnode), path, &len) == 0 && strstr(path, "dyld_shared_cache_x86_64");
 	auto &slot = seen[next++ % arrsize(seen)];
@@ -957,15 +956,22 @@ static void gvaPatchPage(uint8_t *page) {
 }
 
 static void patchValidatedPage(void *vnode, uint8_t *page) {
-	if (gvaPatchOn && isSharedCacheVnode(vnode))
-		gvaPatchPage(page);
+	if (gvaPatchOn && isSharedCacheVnode(vnode)) {
+		if (MachInfo::setKernelWriting(true, nullptr) == KERN_SUCCESS) {
+			gvaPatchPage(page);
+			MachInfo::setKernelWriting(false, nullptr);
+		}
+	}
 	for (auto &patch : pagePatches) {
 		if (!patch.enabled)
 			continue;
 		auto *at = page + patch.pageOffset;
 		if (at[0] == patch.find[0] && !memcmp(at, patch.find, patch.size)) {
-			memcpy(at + patch.at, patch.replace, patch.replaceSize);
-			__atomic_fetch_add(&patch.hits, 1, __ATOMIC_RELAXED);
+			if (MachInfo::setKernelWriting(true, nullptr) == KERN_SUCCESS) {
+				memcpy(at + patch.at, patch.replace, patch.replaceSize);
+				MachInfo::setKernelWriting(false, nullptr);
+				__atomic_fetch_add(&patch.hits, 1, __ATOMIC_RELAXED);
+			}
 		}
 	}
 }
@@ -1018,8 +1024,11 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	msgbufVar = reinterpret_cast<KernelMsgBuf **>(patcher.solveSymbol(KernelPatcher::KernelID, "_msgbufp"));
 	patcher.clearError();
 	bool anyPagePatch = false;
+	bool noAccel = checkKernelArgument("-crnoaccel");
+	int currKernel = getKernelVersion();
 	for (auto &patch : pagePatches) {
-		patch.enabled = checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
+		patch.enabled = !noAccel && (patch.kernelVersion == 0 || patch.kernelVersion == currKernel) &&
+			checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
 			patch.at + patch.replaceSize <= patch.size;
 		anyPagePatch |= patch.enabled;
 	}
@@ -1184,7 +1193,6 @@ void CRDriver::findByConfigSpace() {
 	iterator->release();
 }
 
-static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 static mach_vm_address_t orgConfigureDevice;
 static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci);
 static mach_vm_address_t orgVideoContextStart, videoGetHWInfoOrg;
@@ -1249,8 +1257,6 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		}
 		else if (i == KextFramebuffer)
 			traceFramebuffer(patcher, index, slide, size);
-		else if (i == KextIOAcceleratorFamily2)
-			patchIOAccelerator(patcher, index, slide, size);
 		else if (i == KextAgpm) {
 			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
 			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
@@ -6543,38 +6549,6 @@ void CRDriver::ensureMmio() {
 }
 
 
-static mach_vm_address_t orgMergeEvent;
-static void wrapMergeEvent(void *that, void *dst, void *src) {
-	static uint32_t mergeCalls;
-	uint32_t mNum = ++mergeCalls;
-	if (mNum <= 32) {
-		diskLogEvent("mergeEvent #%u: that=%p dst=%p src=%p", mNum, that, dst, src);
-		flushDiskLogNow();
-	}
-	uintptr_t srcVal = reinterpret_cast<uintptr_t>(src);
-	if (srcVal <= 0x1000) {
-		diskLogEvent("mergeEvent #%u: guarded invalid pointer (that=%p dst=%p src=%p)", mNum, that, dst, src);
-		flushDiskLogNow();
-		return;
-	}
-	FunctionCast(wrapMergeEvent, orgMergeEvent)(that, dst, src);
-}
-
-static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	KernelPatcher::RouteRequest request {
-		"__ZN25IOAccelEventMachineFast210mergeEventEP12IOAccelEventS1_",
-		wrapMergeEvent,
-		orgMergeEvent
-	};
-	if (patcher.routeMultipleLong(index, &request, 1, slide, size)) {
-		traceNote("accel_merge:ok ");
-		diskLogEvent("patchIOAccelerator: hooked mergeEvent successfully");
-	} else {
-		traceNote("accel_merge:err ");
-		diskLogEvent("patchIOAccelerator: failed to hook mergeEvent (err=%d)", patcher.getError());
-		patcher.clearError();
-	}
-}
 
 void CRDriver::probeMMIO() {
 	auto *mmio = mapGpuMmio(iGPU);
