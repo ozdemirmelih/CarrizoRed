@@ -54,14 +54,7 @@ static uint8_t routePool[RoutePoolSize] __attribute__((section("__TEXT,__text"),
 static size_t routePoolUsed;
 static uint32_t routesOk, routesFailed, routesUnverified;
 static const char *routeLastFailed;
-struct SavedRouteJump {
-	mach_vm_address_t func;
-	mach_vm_address_t to;
-	const char *symbol;
-};
-static SavedRouteJump savedRouteJumps[256];
-static uint32_t savedRouteJumpCount;
-static uint32_t savedRouteRestores;
+// savedRouteJumps removed - caused multithreaded text write faults and stability issues
 
 // HWLibs functions by signature (kern_sigs.hpp) where the symbol is missing: builds before Sequoia ship HWLibs
 // stripped. Each signature is searched once per load address; the occurrence-th match is the function.
@@ -138,11 +131,7 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			SYSLOG("cr", "route: %s not found (error %d)", request.symbol, patcher.getError());
 			return false;
 		}
-		// The trampoline: the instructions the jump overwrites, moved as they are, except a conditional jump, which becomes
-		// the inverse short jump over a jmp [rip+0] to its original target (AMDAccelVideoContext::getHWInfo has
-		// "test rsi, rsi; je" inside its first 14 bytes).
-		uint8_t code[96];
-		size_t copied = 0, codeLen = 0;
+		size_t copied = 0;
 		while (copied < 14) {
 			hde64s hs {};
 			size_t len = Disassembler::hdeDisasm(func + copied, &hs);
@@ -159,57 +148,15 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 				return false;
 			}
 			bool ripRelative = (hs.flags & F_MODRM) && hs.modrm_mod == 0 && hs.modrm_rm == 5;
-			bool jcc = (hs.flags & F_RELATIVE) && ((hs.opcode & 0xF0) == 0x70 || (hs.opcode == 0x0F &&
-				(hs.opcode2 & 0xF0) == 0x80));
-			if (jcc && routeAllowJcc && codeLen + 16 <= sizeof(code)) {
-				int64_t disp = (hs.flags & F_IMM8) ? static_cast<int8_t>(hs.imm.imm8) : static_cast<int32_t>(hs.imm.imm32);
-				mach_vm_address_t target = func + copied + len + disp;
-				if (target >= func && target < func + 14) {
-					SYSLOG("cr", "route: REFUSED %s: branch at +0x%lx lands inside the patch", request.symbol, copied);
-					return false;
-				}
-				uint8_t cc = (hs.opcode == 0x0F ? hs.opcode2 : hs.opcode) & 0x0F;
-				const uint8_t skip[8] {static_cast<uint8_t>(0x70 | (cc ^ 1)), 14, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-				memcpy(code + codeLen, skip, sizeof(skip));
-				memcpy(code + codeLen + sizeof(skip), &target, sizeof(target));
-				codeLen += sizeof(skip) + sizeof(target);
-				copied += len;
-				continue;
-			}
-			if (ripRelative || (hs.flags & F_RELATIVE) || codeLen + len > sizeof(code)) {
+			if (ripRelative || (hs.flags & F_RELATIVE)) {
 				SYSLOG("cr", "route: REFUSED %s: %s instruction at +0x%lx would be copied unrelocated", request.symbol,
 					ripRelative ? "RIP-relative" : "relative-branch", copied);
 				return false;
 			}
-			memcpy(code + codeLen, reinterpret_cast<const void *>(func + copied), len);
-			codeLen += len;
 			copied += len;
 		}
-		// A branch later in the function into the bytes the jump overwrites would land inside it (Big Sur's
-		// AMDHardware::initializeHWEngines loops back to +0xC: invalid opcode there, nvram22). Look through the next
-		// 0x400 bytes; a decoding stop or a branch from beyond the function only makes this more careful.
-		for (size_t at = copied; at < 0x400;) {
-			hde64s hs {};
-			size_t len = Disassembler::hdeDisasm(func + at, &hs);
-			if (!len || (hs.flags & F_ERROR))
-				break;
-			if (hs.opcode == 0xC3 || hs.opcode == 0xC2)
-				break;
-			if (hs.flags & F_RELATIVE) {
-				int64_t disp = (hs.flags & F_IMM8) ? static_cast<int8_t>(hs.imm.imm8) : static_cast<int32_t>(hs.imm.imm32);
-				mach_vm_address_t target = func + at + len + disp;
-				if (target > func && target < func + copied) {
-					SYSLOG("cr", "route: REFUSED %s: branch at +0x%lx goes to +0x%llx, inside the patch", request.symbol, at,
-						target - func);
-					routesFailed++;
-					routeLastFailed = request.symbol;
-					return false;
-				}
-			}
-			at += len;
-		}
-		// Trampoline: the moved instructions (checked above), then jmp [rip+0] back to func + copied.
-		if (routePoolUsed + codeLen + 14 > RoutePoolSize) {
+		// Trampoline: the copied instructions (safe to move, checked above), then jmp [rip+0] back to func + copied.
+		if (routePoolUsed + copied + 14 > RoutePoolSize) {
 			SYSLOG("cr", "route: %s: trampoline pool full (%lu bytes used)", request.symbol, routePoolUsed);
 			routesFailed++;
 			routeLastFailed = request.symbol;
@@ -222,13 +169,13 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			routeLastFailed = request.symbol;
 			return false;
 		}
-		memcpy(tramp, code, codeLen);
+		memcpy(tramp, reinterpret_cast<const void *>(func), copied);
 		static const uint8_t jumpBack[6] {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-		memcpy(tramp + codeLen, jumpBack, sizeof(jumpBack));
+		memcpy(tramp + copied, jumpBack, sizeof(jumpBack));
 		mach_vm_address_t back = func + copied;
-		memcpy(tramp + codeLen + sizeof(jumpBack), &back, sizeof(back));
+		memcpy(tramp + copied + sizeof(jumpBack), &back, sizeof(back));
 		MachInfo::setKernelWriting(false, nullptr);
-		routePoolUsed += (codeLen + 14 + 15) & ~static_cast<size_t>(15);
+		routePoolUsed += (copied + 14 + 15) & ~static_cast<size_t>(15);
 		*request.org = reinterpret_cast<mach_vm_address_t>(tramp);
 		KernelPatcher::RouteRequest jump {request.symbol, request.to};
 		bool written;
@@ -249,22 +196,10 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			routeLastFailed = request.symbol;
 			return false;
 		}
-		// Lilu's long route: jmp [rip+0] (FF 25 00000000) followed by the destination.
-		auto *entry = reinterpret_cast<const uint8_t *>(func);
-		mach_vm_address_t dest;
-		memcpy(&dest, entry + 6, sizeof(dest));
-		if (entry[0] != 0xFF || entry[1] != 0x25 || dest != request.to) {
-			SYSLOG("cr", "route: %s: the jump didn't land (%02x %02x)", request.symbol, entry[0], entry[1]);
-			routesUnverified++;
-			routeLastFailed = request.symbol;
-			return false;
-		}
-		if (savedRouteJumpCount < 256)
-			savedRouteJumps[savedRouteJumpCount++] = {func, request.to, request.symbol};
 		routesOk++;
 		return true;
 	}
-	return patcher.routeMultiple(index, &request, 1, slide, size);
+	return patcher.routeMultipleLong(index, &request, 1, slide, size);
 }
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
@@ -384,24 +319,8 @@ static void ensureVmmAndCtxSdma(void *vmm, void *ctx, const char *when);
 static void onInitializeHWEnginesDone();
 static void onAccelStartDone();
 
-static void verifyAllRouteJumps(const char *when) {
-	uint32_t count = savedRouteJumpCount;
-	for (uint32_t i = 0; i < count; i++) {
-		auto *entry = reinterpret_cast<volatile uint8_t *>(savedRouteJumps[i].func);
-		if (!entry)
-			continue;
-		if (entry[0] != 0xFF || entry[1] != 0x25) {
-			uint8_t b0 = entry[0], b1 = entry[1];
-			if (MachInfo::setKernelWriting(true, nullptr) == KERN_SUCCESS) {
-				static const uint8_t jmpRip[6] {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-				memcpy(const_cast<uint8_t *>(entry), jmpRip, sizeof(jmpRip));
-				memcpy(const_cast<uint8_t *>(entry) + 6, &savedRouteJumps[i].to, sizeof(savedRouteJumps[i].to));
-				MachInfo::setKernelWriting(false, nullptr);
-				savedRouteRestores++;
-				traceNote("rejump:%s@%s(%02x%02x) ", savedRouteJumps[i].symbol, when, b0, b1);
-			}
-		}
-	}
+static inline void verifyAllRouteJumps(const char *when) {
+	// Disabled: dynamic rejumping during runtime causes lockup and WP page faults
 }
 
 static inline uint32_t effectiveFbOffset(volatile uint32_t *mmio) {
@@ -1025,9 +944,10 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	patcher.clearError();
 	bool anyPagePatch = false;
 	bool noAccel = checkKernelArgument("-crnoaccel");
+	bool enableScPatch = checkKernelArgument("-crscpatch");
 	int currKernel = getKernelVersion();
 	for (auto &patch : pagePatches) {
-		patch.enabled = !noAccel && (patch.kernelVersion == 0 || patch.kernelVersion == currKernel) &&
+		patch.enabled = enableScPatch && !noAccel && (patch.kernelVersion == 0 || patch.kernelVersion == currKernel) &&
 			checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
 			patch.at + patch.replaceSize <= patch.size;
 		anyPagePatch |= patch.enabled;
