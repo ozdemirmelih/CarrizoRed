@@ -1150,6 +1150,36 @@ static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 
+static mach_vm_address_t orgFreeToPrepareMapping;
+static bool wrapFreeToPrepareMapping(void *that, void *map) {
+	static uint32_t failLogCount = 0;
+	if (orgFreeToPrepareMapping) {
+		bool ok = FunctionCast(wrapFreeToPrepareMapping, orgFreeToPrepareMapping)(that, map);
+		if (ok)
+			return true;
+	}
+	if (failLogCount < 16) {
+		failLogCount++;
+		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original, returning true for UMA", that, map);
+		flushDiskLogNow();
+	}
+	return true;
+}
+
+static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	KernelPatcher::RouteRequest request {
+		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
+		wrapFreeToPrepareMapping,
+		orgFreeToPrepareMapping
+	};
+	if (routeChecked(patcher, index, request, slide, size)) {
+		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
+	} else {
+		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
 		if (kexts[i].loadIndex != index)
@@ -5613,7 +5643,6 @@ void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
 		value |= 0x10000; // Enforce panel logic VDD / BLON bit 16 permanently active
 	}
 	if (!lbFixOff) {
-		uint32_t dword = offset >> 2;
 		if (dword == 0x1AC1 || dword == 0x1CC1 || dword == 0x1EC1) {
 			uint32_t fixed = (value & ~0xFFFu) | 0x6B0;
 			if (fixed != value) {
@@ -5624,7 +5653,6 @@ void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
 	}
 	// DP colour depth: see the DIGxEncoderControl patch in wrapExecuteBiosCommandTable.
 	if (!bpcCapOff && bootDpDepth != 0xFF) {
-		uint32_t dword = offset >> 2;
 		if ((dword == 0x4AA1 || dword == 0x4BA1 || dword == 0x4CA1) && ((value >> 24) & 7) > bootDpDepth) {
 			value = (value & ~0x7000000u) | (static_cast<uint32_t>(bootDpDepth) << 24);
 			__atomic_fetch_add(&bpcCaps, 1, __ATOMIC_RELAXED);
@@ -10388,33 +10416,4 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 void CRDriver::disableKextCallbacks() {
 	for (auto &kext : kexts)
 		kext.switchOff();
-}
-
-bool CRDriver::wrapFreeToPrepareMapping(void *that, void *map) {
-	static uint32_t failLogCount = 0;
-	if (callback && callback->orgFreeToPrepareMapping) {
-		bool ok = FunctionCast(wrapFreeToPrepareMapping, callback->orgFreeToPrepareMapping)(that, map);
-		if (ok)
-			return true;
-	}
-	if (failLogCount < 16) {
-		failLogCount++;
-		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original, returning true for UMA", that, map);
-		flushDiskLogNow();
-	}
-	return true;
-}
-
-void CRDriver::patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	KernelPatcher::RouteRequest request {
-		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
-		wrapFreeToPrepareMapping,
-		orgFreeToPrepareMapping
-	};
-	if (routeChecked(patcher, index, request, slide, size)) {
-		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
-	} else {
-		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
-		patcher.clearError();
-	}
 }
