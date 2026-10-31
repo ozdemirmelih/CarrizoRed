@@ -614,6 +614,10 @@ static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.
 // Catalina's IOPCIFamily still has the flat bundle layout.
 static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily",
 	"/System/Library/Extensions/IOPCIFamily.kext/IOPCIFamily"};
+static const char *pathIOAcceleratorFamily2[] {
+	"/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2",
+	"/System/Library/Extensions/IOAcceleratorFamily2.kext/IOAcceleratorFamily2"
+};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -625,6 +629,7 @@ enum KextIndex : size_t {
 	KextAgpm,
 	KextAgdp,
 	KextPci,
+	KextIOAcceleratorFamily2,
 	KextCount,
 };
 
@@ -652,6 +657,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 		KernelPatcher::KextInfo::Unloaded},
 	// Already loaded (boot KC) by the time Lilu runs.
 	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
+	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
+		arrsize(pathIOAcceleratorFamily2), {}, {}, KernelPatcher::KextInfo::Unloaded},
 };
 
 CRDriver *CRDriver::callback = nullptr;
@@ -1051,8 +1058,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	accelDeferOff = !checkKernelArgument("-cracceldefer") || checkKernelArgument("-crnoaccel");
 
 	logPCIInfo();
-	if (checkKernelArgument("-crmacgpu"))
-		setMacGpuProperties();
+	setMacGpuProperties();
 	setGpuModel();
 	if (!checkKernelArgument("-crnommio"))
 		probeMMIO();
@@ -1202,6 +1208,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				traceKext(patcher, index, slide, size, i);
 		} else if (i == KextRadeonX4000HWLibs && !checkKernelArgument("-crnoaccel"))
 			traceKext(patcher, index, slide, size, i);
+		else if (i == KextIOAcceleratorFamily2)
+			patchIOAccelerator(patcher, index, slide, size);
 		return;
 	}
 }
@@ -2678,13 +2686,21 @@ namespace {
 			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 			return 0;
 		}
-		if (!strcmp(stages[N].name, "setBacklight") || !strcmp(stages[N].name, "atom.transmitter") || !strcmp(stages[N].name, "turnOnDigon")) {
+		if (!strcmp(stages[N].name, "atom.setDisplayClock")) {
+			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
+			return 0; // kIOReturnSuccess - Stoney APU display clock is pre-set by firmware
+		}
+		if (!strcmp(stages[N].name, "setBacklight") || !strcmp(stages[N].name, "atom.transmitter") || !strcmp(stages[N].name, "turnOnDigon") || !strcmp(stages[N].name, "eDPPanelPower") || !strcmp(stages[N].name, "turnOnInternalPanelPower")) {
 			if (gpuMmio) {
-				if ((gpuMmio[0x481B] & 0x10000) == 0)
-					gpuMmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : (gpuMmio[0x481B] | 0x10000);
+				gpuMmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : 0x30311;
 			}
 		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
+		if (!strcmp(stages[N].name, "setBacklight") || !strcmp(stages[N].name, "atom.transmitter") || !strcmp(stages[N].name, "turnOnDigon") || !strcmp(stages[N].name, "eDPPanelPower") || !strcmp(stages[N].name, "turnOnInternalPanelPower")) {
+			if (gpuMmio) {
+				gpuMmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : 0x30311;
+			}
+		}
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
 		if (!strcmp(stages[N].name, "hw.initializeHWEngines"))
@@ -3167,6 +3183,11 @@ static uint64_t wrapResourcePrepare(void *that) {
 	if (pNum <= 32) {
 		diskLogEvent("resource::prepare #%u: that=%p -> ret=%llx", pNum, that, ret);
 		flushDiskLogNow();
+	}
+	if (ret != 0) {
+		diskLogEvent("resource::prepare #%u: that=%p returned %llx, overridden to 0 for UMA", pNum, that, ret);
+		flushDiskLogNow();
+		ret = 0;
 	}
 	return ret;
 }
@@ -5587,6 +5608,10 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 // keep Apple's other fields. -crnolbfix disables.
 
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
+	uint32_t dword = offset >> 2;
+	if (dword == 0x481B) {
+		value |= 0x10000; // Enforce panel logic VDD / BLON bit 16 permanently active
+	}
 	if (!lbFixOff) {
 		uint32_t dword = offset >> 2;
 		if (dword == 0x1AC1 || dword == 0x1CC1 || dword == 0x1EC1) {
@@ -6655,6 +6680,8 @@ void CRDriver::relocateFb() {
 	SYSLOG("cr", "FB window moved from 0x%llX to 0: MC_VM_FB_LOCATION 0x%08X -> 0x%08X (reads 0x%08X), HDP base 0x%X",
 		base, location, moved, fbRelocReadback, hdp);
 	iGPU->setProperty("CarrizoRed,fb-relocated", fbRelocReadback == moved);
+	if ((mmio[0x481B] & 0x10000) == 0)
+		mmio[0x481B] = bootBacklightPwrSeq ? bootBacklightPwrSeq : 0x30311;
 }
 
 // Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
@@ -6802,6 +6829,15 @@ void CRDriver::initDisplayRegs() {
 		reg.valid = true;
 		reg.bootValue = reg.value;
 		reg.bootValid = true;
+	}
+	if (gpuMmio) {
+		uint32_t pwrSeq = gpuMmio[0x481B];
+		if (pwrSeq & 0x10000)
+			bootBacklightPwrSeq = pwrSeq;
+		uint32_t pwm = gpuMmio[0x4820];
+		if (pwm & 0x80000000)
+			bootBacklightPwm = pwm;
+		SYSLOG("cr", "boot: LVTMA_PWRSEQ_CNTL 0x%08X, LVTMA_BL_PWM_CNTL 0x%08X", bootBacklightPwrSeq, bootBacklightPwm);
 	}
 	{
 		uint32_t n = 0;
@@ -10352,4 +10388,33 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 void CRDriver::disableKextCallbacks() {
 	for (auto &kext : kexts)
 		kext.switchOff();
+}
+
+bool CRDriver::wrapFreeToPrepareMapping(void *that, void *map) {
+	static uint32_t failLogCount = 0;
+	if (callback && callback->orgFreeToPrepareMapping) {
+		bool ok = FunctionCast(wrapFreeToPrepareMapping, callback->orgFreeToPrepareMapping)(that, map);
+		if (ok)
+			return true;
+	}
+	if (failLogCount < 16) {
+		failLogCount++;
+		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original, returning true for UMA", that, map);
+		flushDiskLogNow();
+	}
+	return true;
+}
+
+void CRDriver::patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	KernelPatcher::RouteRequest request {
+		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
+		wrapFreeToPrepareMapping,
+		orgFreeToPrepareMapping
+	};
+	if (routeChecked(patcher, index, request, slide, size)) {
+		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
+	} else {
+		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
+		patcher.clearError();
+	}
 }
