@@ -1160,22 +1160,48 @@ static bool wrapFreeToPrepareMapping(void *that, void *map) {
 	}
 	if (failLogCount < 16) {
 		failLogCount++;
-		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original, returning true for UMA", that, map);
+		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original, returning false (fallback to sysmem)", that, map);
 		flushDiskLogNow();
 	}
-	return true;
+	return false;
+}
+
+static mach_vm_address_t orgMoveMemoryToHead;
+static void wrapMoveMemoryToHead(void *that, void *vidMem) {
+	if (!that || !vidMem) {
+		static uint32_t nullWarn;
+		if (nullWarn++ < 16) {
+			diskLogEvent("moveMemoryToHead: trapped null pointer that=%p vidMem=%p, avoiding panic", that, vidMem);
+			flushDiskLogNow();
+		}
+		return;
+	}
+	if (orgMoveMemoryToHead)
+		FunctionCast(wrapMoveMemoryToHead, orgMoveMemoryToHead)(that, vidMem);
 }
 
 static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	KernelPatcher::RouteRequest request {
+	KernelPatcher::RouteRequest requestFree {
 		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
 		wrapFreeToPrepareMapping,
 		orgFreeToPrepareMapping
 	};
-	if (routeChecked(patcher, index, request, slide, size)) {
+	if (routeChecked(patcher, index, requestFree, slide, size)) {
 		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
 	} else {
 		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+
+	KernelPatcher::RouteRequest requestMove {
+		"__ZN20IOAccelVidMemoryList16moveMemoryToHeadEP16IOAccelVidMemory",
+		wrapMoveMemoryToHead,
+		orgMoveMemoryToHead
+	};
+	if (routeChecked(patcher, index, requestMove, slide, size)) {
+		SYSLOG("cr", "IOAccelerator: routed moveMemoryToHead successfully");
+	} else {
+		SYSLOG("cr", "IOAccelerator: failed to route moveMemoryToHead (error %d)", patcher.getError());
 		patcher.clearError();
 	}
 }
@@ -3213,11 +3239,6 @@ static uint64_t wrapResourcePrepare(void *that) {
 	if (pNum <= 32) {
 		diskLogEvent("resource::prepare #%u: that=%p -> ret=%llx", pNum, that, ret);
 		flushDiskLogNow();
-	}
-	if (ret != 0) {
-		diskLogEvent("resource::prepare #%u: that=%p returned %llx, overridden to 0 for UMA", pNum, that, ret);
-		flushDiskLogNow();
-		ret = 0;
 	}
 	return ret;
 }
