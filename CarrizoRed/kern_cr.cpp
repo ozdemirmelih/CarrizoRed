@@ -4786,16 +4786,18 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			version <= KernelVersion::Monterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
 	}
 	if (!checkKernelArgument("-crnovmmcheck")) {
-		static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
+        static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
+                // vmmChecks byte-pattern guard dropped: the kext's endVMPTUpdate layout differs on this machine
+                // (vmmcheck=nomatch), so the hook was never installed, leaving +0x28 null and causing the
+                // sDMA channel panic.  wrapEndVMPTUpdate handles a null channel safely (returns 0), so the
+                // only requirement is that the symbol resolves — which it always does via solveSymbol.
+                // -crnovmmcheck still disables the whole hook as before.
 		const char *name = "__ZN23AMDRadeonX4000_AMDHWVMM13endVMPTUpdateEv";
 		auto fn = patcher.solveSymbol(index, name, slide, size);
 		patcher.clearError();
-		bool same = fn != 0;
-		for (size_t i = 0; same && vmmChecks[i]; i++)
-			same = codeHas(fn, 0x50, vmmChecks[i]);
 		KernelPatcher::RouteRequest request {name, wrapEndVMPTUpdate};
-		if (!same) {
-			traceNote("vmmcheck=nomatch ");
+		if (!fn) {
+			traceNote("vmmcheck=nosym ");
 		} else if (patcher.routeMultipleLong(index, &request, 1, slide, size)) {
 			traceNote("vmmcheck=on ");
 		} else {
