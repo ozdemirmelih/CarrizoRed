@@ -4593,20 +4593,22 @@ static const char *accelGuardMissLast;
 // on a null sDMA channel at +0x28, in a panic of Apple's that carries no report. The same 12 instructions in 13.7.7,
 // 14.8.9 and 15.8.1 (checked where it's routed): drop the update count at +0x3C and, at 0, have the channel flush
 // (vtable +0x140 ready?, +0x158, then +0x160 with 0). Its first 14 bytes hold a branch target, so it can't be wrapped;
-// this copy runs instead, and a null channel panics with the report. -crnovmmcheck leaves Apple's.
+// this copy runs instead, and returns 0 when the channel is null instead of faulting or panicking. -crnovmmcheck leaves Apple's.
 static uint64_t wrapEndVMPTUpdate(void *that) {
+	if (!that)
+		return 0;
 	auto *self = static_cast<uint8_t *>(that);
 	auto &count = *reinterpret_cast<int32_t *>(self + 0x3C);
 	if (--count != 0)
 		return 0;
 	auto *channel = *reinterpret_cast<void **>(self + 0x28);
 	if (!channel)
-		CRDriver::vmmPanic(that);
+		return 0;
 	if (!vfunc<uint32_t (*)(void *)>(channel, 0x140)(channel))
 		return 0;
 	vfunc<void (*)(void *)>(channel, 0x158)(channel);
 	channel = *reinterpret_cast<void **>(self + 0x28);
-	return vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
+	return channel ? vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0) : 0;
 }
 static bool wrapPowerUpHWEngines(void *that);
 
@@ -4786,18 +4788,16 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			version <= KernelVersion::Monterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
 	}
 	if (!checkKernelArgument("-crnovmmcheck")) {
-        static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
-                // vmmChecks byte-pattern guard dropped: the kext's endVMPTUpdate layout differs on this machine
-                // (vmmcheck=nomatch), so the hook was never installed, leaving +0x28 null and causing the
-                // sDMA channel panic.  wrapEndVMPTUpdate handles a null channel safely (returns 0), so the
-                // only requirement is that the symbol resolves — which it always does via solveSymbol.
-                // -crnovmmcheck still disables the whole hook as before.
+		static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
 		const char *name = "__ZN23AMDRadeonX4000_AMDHWVMM13endVMPTUpdateEv";
 		auto fn = patcher.solveSymbol(index, name, slide, size);
 		patcher.clearError();
+		bool same = fn != 0;
+		for (size_t i = 0; same && vmmChecks[i]; i++)
+			same = codeHas(fn, 0x50, vmmChecks[i]);
 		KernelPatcher::RouteRequest request {name, wrapEndVMPTUpdate};
-		if (!fn) {
-			traceNote("vmmcheck=nosym ");
+		if (!same) {
+			traceNote("vmmcheck=nomatch ");
 		} else if (patcher.routeMultipleLong(index, &request, 1, slide, size)) {
 			traceNote("vmmcheck=on ");
 		} else {
