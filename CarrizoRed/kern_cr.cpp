@@ -4685,6 +4685,25 @@ static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t offset) {
 	return 0;
 }
 
+static uint64_t wrapPageon(void *that, void *event, bool flag, uint64_t offset) {
+	// UMA APU: memory resides in unified host RAM carveout; no discrete VRAM to page into.
+	// The original attempts to page via null discrete channel/descriptor at +0x153 (page fault).
+	static uint32_t pageonCalls;
+	if (pageonCalls++ < 32)
+		diskLogEvent("pageon #%u: that=%p event=%p flag=%d offset=0x%llx -> ok (bypassed)",
+			pageonCalls, that, event, flag, offset);
+	return 0;
+}
+
+static uint64_t wrapPageoff(void *that, void *event, bool flag, uint64_t offset) {
+	// UMA APU: memory resides in unified host RAM; no discrete VRAM to page out of.
+	static uint32_t pageoffCalls;
+	if (pageoffCalls++ < 32)
+		diskLogEvent("pageoff #%u: that=%p event=%p flag=%d offset=0x%llx -> ok (bypassed)",
+			pageoffCalls, that, event, flag, offset);
+	return 0;
+}
+
 static uint64_t wrapInitFillRegions(void *that) {
 	static uint32_t fillCalls;
 	uint32_t fNum = ++fillCalls;
@@ -4899,6 +4918,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	KernelPatcher::RouteRequest bypassRequests[] {
 		{"__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
 			reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource6pageonEP12IOAccelEventby",
+			reinterpret_cast<mach_vm_address_t>(wrapPageon)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource7pageoffEP12IOAccelEventby",
+			reinterpret_cast<mach_vm_address_t>(wrapPageoff)},
 		{"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
 			reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)},
 	};
