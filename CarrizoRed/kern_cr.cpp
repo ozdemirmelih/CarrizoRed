@@ -1600,7 +1600,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				traceKext(patcher, index, slide, size, i);
 		} else if (i == KextRadeonX4000HWLibs && !checkKernelArgument("-crnoaccel"))
 			traceKext(patcher, index, slide, size, i);
-		else if (i == KextIOAcceleratorFamily2)
+		else if (i == KextIOAcceleratorFamily2 && !checkKernelArgument("-crnoaccel"))
 			patchIOAccelerator(patcher, index, slide, size);
 		return;
 	}
