@@ -4672,6 +4672,19 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 }
 static bool wrapPowerUpHWEngines(void *that);
 
+static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t offset) {
+	// UMA APU: no discrete VRAM blitter/sDMA channel 1 to zero through.
+	// The original dereferences a null sDMA blit channel at +0x514, causing a page fault.
+	// Called from both initFillRegions and prepare()->zero_vidmem(); both paths are safe
+	// to no-op because WindowServer is the caller (not early boot), so no IOAccelEvent
+	// fence stall can occur here.
+	static uint32_t zeroCalls;
+	if (zeroCalls++ < 16)
+		diskLogEvent("zeroVidMemory #%u: that=%p event=%p offset=0x%llx -> ok (bypassed)",
+			zeroCalls, that, event, offset);
+	return 0;
+}
+
 static uint64_t wrapInitFillRegions(void *that) {
 	static uint32_t fillCalls;
 	uint32_t fNum = ++fillCalls;
@@ -4883,15 +4896,19 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
 			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
 	}
-	KernelPatcher::RouteRequest requestInitFill {
-		"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
-		reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)
+	KernelPatcher::RouteRequest bypassRequests[] {
+		{"__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
+			reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
+			reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)},
 	};
-	if (patcher.routeMultipleLong(index, &requestInitFill, 1, slide, size)) {
-		diskLogEvent("accel: routed initFillRegions successfully");
-	} else {
-		diskLogEvent("accel: failed to route initFillRegions (error %d)", patcher.getError());
-		patcher.clearError();
+	for (auto &req : bypassRequests) {
+		if (patcher.routeMultipleLong(index, &req, 1, slide, size)) {
+			diskLogEvent("accel: routed %s successfully", req.symbol);
+		} else {
+			diskLogEvent("accel: failed to route %s (error %d)", req.symbol, patcher.getError());
+			patcher.clearError();
+		}
 	}
 }
 
