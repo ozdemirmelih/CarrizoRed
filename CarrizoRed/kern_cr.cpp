@@ -4677,6 +4677,42 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 }
 static bool wrapPowerUpHWEngines(void *that);
 
+static mach_vm_address_t orgZeroVidMemory;
+static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t arg) {
+	static uint32_t zeroCalls;
+	uint32_t zNum = ++zeroCalls;
+	if (zNum <= 32)
+		diskLogEvent("zeroVidMemory #%u: that=%p event=%p arg=0x%llx -> ok (bypassed)", zNum, that, event, arg);
+	return 0;
+}
+
+static mach_vm_address_t orgPageon;
+static uint64_t wrapPageon(void *that, void *event, bool flag, uint64_t arg) {
+	static uint32_t pageonCalls;
+	uint32_t pNum = ++pageonCalls;
+	if (pNum <= 32)
+		diskLogEvent("pageon #%u: that=%p event=%p flag=%d arg=0x%llx -> ok (bypassed)", pNum, that, event, flag, arg);
+	return 0;
+}
+
+static mach_vm_address_t orgPageoff;
+static uint64_t wrapPageoff(void *that, void *event, bool flag, uint64_t arg) {
+	static uint32_t pageoffCalls;
+	uint32_t pNum = ++pageoffCalls;
+	if (pNum <= 32)
+		diskLogEvent("pageoff #%u: that=%p event=%p flag=%d arg=0x%llx -> ok (bypassed)", pNum, that, event, flag, arg);
+	return 0;
+}
+
+static mach_vm_address_t orgInitFillRegions;
+static uint64_t wrapInitFillRegions(void *that) {
+	static uint32_t fillCalls;
+	uint32_t fNum = ++fillCalls;
+	if (fNum <= 32)
+		diskLogEvent("initFillRegions #%u: that=%p -> ok (bypassed)", fNum, that);
+	return 0;
+}
+
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	selectAccelLayouts();
 	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
@@ -4880,6 +4916,18 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
 			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
 	}
+	route("__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
+		reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory), orgZeroVidMemory, nullptr, 0,
+		"zeroVidMemory");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource6pageonEP12IOAccelEventby",
+		reinterpret_cast<mach_vm_address_t>(wrapPageon), orgPageon, nullptr, 0,
+		"pageon");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource7pageoffEP12IOAccelEventby",
+		reinterpret_cast<mach_vm_address_t>(wrapPageoff), orgPageoff, nullptr, 0,
+		"pageoff");
+	route("__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
+		reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions), orgInitFillRegions, nullptr, 0,
+		"initFillRegions");
 }
 
 bool CRDriver::wrapAllocateHWEngines(void *that) {
@@ -7899,16 +7947,6 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	auto read = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes);
 	auto write = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes);
 	assrProbe(that, flags, read);
-
-	// Intercept DPCD 0x600 (SET_POWER): Prevent AGDP PMDisplaySleep from shutting off internal eDP panel (D3 sleep 0x01)
-	if (address == 0x600 && length >= 1 && data && data[0] == 0x01) {
-		diskLogEvent("dpcd write 600 = 01 (D3 sleep) BLOCKED for internal eDP panel, enforcing D0 (0x02)");
-		uint8_t d0 = 0x02;
-		IOReturn r = write(that, 0x600, 1, &d0, flags);
-		dpcdRecord(0x600, 1, true, &d0, r);
-		return kIOReturnSuccess;
-	}
-
 	// Wake #27 (log 1793356172): at the start of training (TPS1) after the wake LVTMA_PWRSEQ_CNTL read 0x11 against the
 	// boot's 0x20211 (SYNCEN_OVRD and DIGON_OVRD; SYNCEN gates the transmitter's data output) and DIG_FE_CNTL 0 against
 	// 0x1000000 (DIG_SYMCLK_FE_ON), and clock recovery failed every time. In a wake session, just before Apple starts
