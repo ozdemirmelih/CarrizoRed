@@ -1501,13 +1501,18 @@ static bool wrapFreeToPrepareMapping(void *that, void *map) {
 	return true;
 }
 
-static mach_vm_address_t orgMoveMemoryToHead;
 static void wrapMoveMemoryToHead(void *that, void *vidMem) {
 	// Bypassed on APU UMA: discrete LRU eviction list reordering is not used on unified memory
 	// and calling the original writes to [NULL + 0xb0] (+0x1a) because unlinked UMA nodes have null list pointers.
 	static uint32_t moveCalls;
 	if (moveCalls++ < 16)
 		diskLogEvent("moveMemoryToHead #%u: that=%p vidMem=%p -> ok (bypassed)", moveCalls, that, vidMem);
+}
+
+static void wrapRemoveMemory(void *that, void *vidMem) {
+	static uint32_t removeCalls;
+	if (removeCalls++ < 16)
+		diskLogEvent("removeMemory #%u: that=%p vidMem=%p -> ok (bypassed)", removeCalls, that, vidMem);
 }
 
 static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
@@ -1517,21 +1522,30 @@ static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 		orgFreeToPrepareMapping
 	};
 	if (routeChecked(patcher, index, requestFree, slide, size)) {
-		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
+		diskLogEvent("IOAccelerator: routed freeToPrepareMapping successfully");
 	} else {
-		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
+		diskLogEvent("IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
 		patcher.clearError();
 	}
 
 	KernelPatcher::RouteRequest requestMove {
 		"__ZN20IOAccelVidMemoryList16moveMemoryToHeadEP16IOAccelVidMemory",
-		wrapMoveMemoryToHead,
-		orgMoveMemoryToHead
+		reinterpret_cast<mach_vm_address_t>(wrapMoveMemoryToHead)
 	};
-	if (routeChecked(patcher, index, requestMove, slide, size)) {
-		SYSLOG("cr", "IOAccelerator: routed moveMemoryToHead successfully");
+	if (patcher.routeMultipleLong(index, &requestMove, 1, slide, size)) {
+		diskLogEvent("IOAccelerator: routed moveMemoryToHead successfully");
 	} else {
-		SYSLOG("cr", "IOAccelerator: failed to route moveMemoryToHead (error %d)", patcher.getError());
+		diskLogEvent("IOAccelerator: failed to route moveMemoryToHead (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+
+	KernelPatcher::RouteRequest requestRemove {
+		"__ZN20IOAccelVidMemoryList12removeMemoryEP16IOAccelVidMemory",
+		reinterpret_cast<mach_vm_address_t>(wrapRemoveMemory)
+	};
+	if (patcher.routeMultipleLong(index, &requestRemove, 1, slide, size)) {
+		diskLogEvent("IOAccelerator: routed removeMemory successfully");
+	} else {
 		patcher.clearError();
 	}
 }
@@ -4674,7 +4688,6 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 }
 static bool wrapPowerUpHWEngines(void *that);
 
-static mach_vm_address_t orgZeroVidMemory;
 static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t arg) {
 	static uint32_t zeroCalls;
 	uint32_t zNum = ++zeroCalls;
@@ -4683,7 +4696,6 @@ static uint64_t wrapZeroVidMemory(void *that, void *event, uint64_t arg) {
 	return 0;
 }
 
-static mach_vm_address_t orgPageon;
 static uint64_t wrapPageon(void *that, void *event, bool flag, uint64_t arg) {
 	static uint32_t pageonCalls;
 	uint32_t pNum = ++pageonCalls;
@@ -4692,7 +4704,6 @@ static uint64_t wrapPageon(void *that, void *event, bool flag, uint64_t arg) {
 	return 0;
 }
 
-static mach_vm_address_t orgPageoff;
 static uint64_t wrapPageoff(void *that, void *event, bool flag, uint64_t arg) {
 	static uint32_t pageoffCalls;
 	uint32_t pNum = ++pageoffCalls;
@@ -4701,7 +4712,6 @@ static uint64_t wrapPageoff(void *that, void *event, bool flag, uint64_t arg) {
 	return 0;
 }
 
-static mach_vm_address_t orgInitFillRegions;
 static uint64_t wrapInitFillRegions(void *that) {
 	static uint32_t fillCalls;
 	uint32_t fNum = ++fillCalls;
@@ -4913,18 +4923,24 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
 			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
 	}
-	route("__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
-		reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory), orgZeroVidMemory, nullptr, 0,
-		"zeroVidMemory");
-	route("__ZN31AMDRadeonX4000_AMDAccelResource6pageonEP12IOAccelEventby",
-		reinterpret_cast<mach_vm_address_t>(wrapPageon), orgPageon, nullptr, 0,
-		"pageon");
-	route("__ZN31AMDRadeonX4000_AMDAccelResource7pageoffEP12IOAccelEventby",
-		reinterpret_cast<mach_vm_address_t>(wrapPageoff), orgPageoff, nullptr, 0,
-		"pageoff");
-	route("__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
-		reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions), orgInitFillRegions, nullptr, 0,
-		"initFillRegions");
+	KernelPatcher::RouteRequest bypassRequests[] {
+		{"__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
+			reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource6pageonEP12IOAccelEventby",
+			reinterpret_cast<mach_vm_address_t>(wrapPageon)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource7pageoffEP12IOAccelEventby",
+			reinterpret_cast<mach_vm_address_t>(wrapPageoff)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
+			reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)}
+	};
+	for (auto &req : bypassRequests) {
+		if (patcher.routeMultipleLong(index, &req, 1, slide, size)) {
+			diskLogEvent("accel: routed %s successfully", req.symbol);
+		} else {
+			diskLogEvent("accel: failed to route %s (error %d)", req.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
 }
 
 bool CRDriver::wrapAllocateHWEngines(void *that) {
