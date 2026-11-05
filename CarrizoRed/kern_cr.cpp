@@ -1509,6 +1509,58 @@ static void wrapMoveMemoryToHead(void *that, void *vidMem) {
 		diskLogEvent("moveMemoryToHead #%u: that=%p vidMem=%p -> ok (bypassed)", moveCalls, that, vidMem);
 }
 
+static mach_vm_address_t orgMergeEvent;
+static void wrapMergeEvent(void *that, void *dst, void *src) {
+	static uint32_t mergeCalls;
+	uint32_t mNum = ++mergeCalls;
+	if (mNum <= 32)
+		diskLogEvent("mergeEvent #%u: that=%p dst=%p src=%p", mNum, that, dst, src);
+
+	if (!that || !dst || !src || (uintptr_t)dst < 0x10000 || (uintptr_t)src < 0x10000) {
+		if (mNum <= 32)
+			diskLogEvent("mergeEvent #%u: guarded invalid pointer (that=%p dst=%p src=%p)", mNum, that, dst, src);
+		return;
+	}
+	uintptr_t subDst = *reinterpret_cast<uintptr_t *>(dst);
+	uintptr_t subSrc = *reinterpret_cast<uintptr_t *>(src);
+	if (subDst < 0x10000 || subSrc < 0x10000) {
+		if (mNum <= 32)
+			diskLogEvent("mergeEvent #%u: guarded sub-ptr NULL/invalid (dst->sub=0x%lx src->sub=0x%lx)",
+				mNum, (unsigned long)subDst, (unsigned long)subSrc);
+		return;
+	}
+	if (orgMergeEvent)
+		FunctionCast(wrapMergeEvent, orgMergeEvent)(that, dst, src);
+}
+
+static mach_vm_address_t orgSetCurrentPlaneIOSurfaceDeviceCache;
+static uint64_t wrapSetCurrentPlaneIOSurfaceDeviceCache(void *that, void *event, uint32_t plane, uint32_t flags, void *cache) {
+	static uint32_t scpCalls;
+	uint32_t cNum = ++scpCalls;
+	if (cNum <= 32)
+		diskLogEvent("set_current_plane #%u: that=%p ev=%p plane=%u fl=%u cache=%p",
+			cNum, that, event, plane, flags, cache);
+
+	if (event) {
+		if ((uintptr_t)event < 0x10000) {
+			if (cNum <= 32)
+				diskLogEvent("set_current_plane #%u: sanitized low event %p -> nullptr", cNum, event);
+			event = nullptr;
+		} else {
+			uintptr_t sub = *reinterpret_cast<uintptr_t *>(event);
+			if (sub < 0x10000) {
+				if (cNum <= 32)
+					diskLogEvent("set_current_plane #%u: sanitized unbacked event %p (sub=0x%lx) -> nullptr",
+						cNum, event, (unsigned long)sub);
+				event = nullptr;
+			}
+		}
+	}
+	if (orgSetCurrentPlaneIOSurfaceDeviceCache)
+		return FunctionCast(wrapSetCurrentPlaneIOSurfaceDeviceCache, orgSetCurrentPlaneIOSurfaceDeviceCache)(that, event, plane, flags, cache);
+	return 0;
+}
+
 static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	KernelPatcher::RouteRequest requestFree {
 		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
@@ -1530,6 +1582,30 @@ static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 		diskLogEvent("IOAccelerator: routed moveMemoryToHead successfully");
 	} else {
 		diskLogEvent("IOAccelerator: failed to route moveMemoryToHead (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+
+	KernelPatcher::RouteRequest requestMerge {
+		"__ZN24IOAccelEventMachineFast210mergeEventEP12IOAccelEventS1_",
+		wrapMergeEvent,
+		orgMergeEvent
+	};
+	if (routeChecked(patcher, index, requestMerge, slide, size)) {
+		diskLogEvent("IOAccelerator: routed mergeEvent successfully");
+	} else {
+		diskLogEvent("IOAccelerator: failed to route mergeEvent (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+
+	KernelPatcher::RouteRequest requestPlane {
+		"__ZN18IOAccelDisplayPipe38set_current_plane_ioSurfaceDeviceCacheEP12IOAccelEventjjP20IOSurfaceDeviceCache",
+		wrapSetCurrentPlaneIOSurfaceDeviceCache,
+		orgSetCurrentPlaneIOSurfaceDeviceCache
+	};
+	if (routeChecked(patcher, index, requestPlane, slide, size)) {
+		diskLogEvent("IOAccelerator: routed set_current_plane successfully");
+	} else {
+		diskLogEvent("IOAccelerator: failed to route set_current_plane (error %d)", patcher.getError());
 		patcher.clearError();
 	}
 }
@@ -4712,6 +4788,77 @@ static uint64_t wrapInitFillRegions(void *that) {
 	return 0;
 }
 
+static uint64_t wrapResourcePrepare(void *that) {
+	static uint32_t prepCalls;
+	uint32_t pNum = ++prepCalls;
+	if (pNum <= 32)
+		diskLogEvent("resource::prepare #%u: that=%p -> ok (bypassed)", pNum, that);
+	return 1;
+}
+
+static mach_vm_address_t orgAssignVMID;
+static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *channel, void **event, bool *pBool) {
+	static uint32_t assignCalls;
+	uint32_t aNum = ++assignCalls;
+
+	auto *vb = static_cast<uint8_t *>(that);
+
+	// On Stoney Ridge APU, discrete sDMA command submission
+	// dereferences NULL or uninitialized sDMA TLB descriptors at assignVMID + 0x1af (CR2=0),
+	// panicking WindowServer during hardware command submission.
+	// Perform safe APU VMID assignment:
+	// 1. Determine the channel's engine index (0 for GFX)
+	void *ring = channel ? vfunc<void *(*)(void *)>(channel, 0x218)(channel) : nullptr;
+	uint32_t engine = ring ? vfunc<uint32_t (*)(void *)>(ring, 0x138)(ring) : 0;
+
+	// 2. Look up the VMID already assigned to this context for this engine
+	uint32_t *ctxVmids = ctx ? reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ctx) + 0x118) : nullptr;
+	uint32_t curVmid = ctxVmids ? ctxVmids[engine] : 0;
+	bool newlyAssigned = false;
+
+	if (curVmid == 0 && that) {
+		// Call allocateVMID(engine, ctx) on AMDHWVMM (vtable offset 0x170)
+		curVmid = vfunc<uint32_t (*)(void *, uint32_t, void *)>(that, 0x170)(that, engine, ctx);
+		if (curVmid == 0)
+			curVmid = 1; // Default to VMID 1 if allocator returned 0
+		if (ctxVmids)
+			ctxVmids[engine] = curVmid;
+		newlyAssigned = true;
+
+		// Record the context in the VMM table at 0x88 + engine*0x500 + curVmid*0x50
+		uint8_t *vmmTable = vb + 0x88 + engine * 0x500 + curVmid * 0x50;
+		*reinterpret_cast<void **>(vmmTable) = ctx;
+
+		// Increment sequence counter at that + 0xa90
+		uint32_t *pSeq = reinterpret_cast<uint32_t *>(vb + 0xa90);
+		uint32_t seq = ++(*pSeq);
+		*reinterpret_cast<uint32_t *>(vmmTable + 0x48) = seq;
+	}
+
+	vmid = curVmid ? curVmid : 1;
+
+	// 3. If an event pointer is requested:
+	// On Stoney Ridge APU we do not submit an sDMA TLB flush packet, so no event/fence is created.
+	// We MUST set *event = nullptr so callers know there is no pending event to wait on.
+	// Setting *event to unbacked table memory caused IOAccelEventMachineFast2::mergeEvent to dereference NULL+0x38!
+	if (event)
+		*event = nullptr;
+
+	// 4. Notify context that VMID is assigned (vtable offset 0x170 on ctx)
+	if (ctx)
+		vfunc<void (*)(void *, uint32_t)>(ctx, 0x170)(ctx, engine);
+
+	// 5. Set switch flag if requested
+	if (pBool)
+		*pBool = newlyAssigned;
+
+	if (aNum <= 32)
+		diskLogEvent("assignVMID #%u (APU safe): vmm=%p ctx=%p ch=%p eng=%u vmid=%u new=%d",
+			aNum, that, ctx, channel, engine, vmid, newlyAssigned);
+
+	return 1; // true
+}
+
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	selectAccelLayouts();
 	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
@@ -4924,12 +5071,34 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapPageoff)},
 		{"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
 			reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)},
+		{"__ZN31AMDRadeonX4000_AMDAccelResource7prepareEv",
+			reinterpret_cast<mach_vm_address_t>(wrapResourcePrepare)},
 	};
 	for (auto &req : bypassRequests) {
 		if (patcher.routeMultipleLong(index, &req, 1, slide, size)) {
 			diskLogEvent("accel: routed %s successfully", req.symbol);
 		} else {
 			diskLogEvent("accel: failed to route %s (error %d)", req.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+
+	KernelPatcher::RouteRequest requestAssign {
+		"__ZN23AMDRadeonX4000_AMDHWVMM10assignVMIDEP30AMDRadeonX4000_IAMDHWVMContextRjP30AMDRadeonX4000_AMDAccelChannelPP12IOAccelEventPb",
+		reinterpret_cast<mach_vm_address_t>(wrapAssignVMID),
+		orgAssignVMID
+	};
+	if (routeChecked(patcher, index, requestAssign, slide, size)) {
+		diskLogEvent("accel: routed assignVMID successfully");
+	} else {
+		KernelPatcher::RouteRequest requestAssignLong {
+			"__ZN23AMDRadeonX4000_AMDHWVMM10assignVMIDEP30AMDRadeonX4000_IAMDHWVMContextRjP30AMDRadeonX4000_AMDAccelChannelPP12IOAccelEventPb",
+			reinterpret_cast<mach_vm_address_t>(wrapAssignVMID)
+		};
+		if (patcher.routeMultipleLong(index, &requestAssignLong, 1, slide, size)) {
+			diskLogEvent("accel: routed assignVMID (long) successfully");
+		} else {
+			diskLogEvent("accel: failed to route assignVMID (error %d)", patcher.getError());
 			patcher.clearError();
 		}
 	}
