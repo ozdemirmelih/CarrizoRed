@@ -1503,14 +1503,11 @@ static bool wrapFreeToPrepareMapping(void *that, void *map) {
 
 static mach_vm_address_t orgMoveMemoryToHead;
 static void wrapMoveMemoryToHead(void *that, void *vidMem) {
-	if (!that || !vidMem) {
-		static uint32_t nullWarn;
-		if (nullWarn++ < 16)
-			diskLogEvent("moveMemoryToHead: trapped null pointer that=%p vidMem=%p, avoiding panic", that, vidMem);
-		return;
-	}
-	if (orgMoveMemoryToHead)
-		FunctionCast(wrapMoveMemoryToHead, orgMoveMemoryToHead)(that, vidMem);
+	// Bypassed on APU UMA: discrete LRU eviction list reordering is not used on unified memory
+	// and calling the original writes to [NULL + 0xb0] (+0x1a) because unlinked UMA nodes have null list pointers.
+	static uint32_t moveCalls;
+	if (moveCalls++ < 16)
+		diskLogEvent("moveMemoryToHead #%u: that=%p vidMem=%p -> ok (bypassed)", moveCalls, that, vidMem);
 }
 
 static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
