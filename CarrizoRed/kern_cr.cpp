@@ -844,7 +844,7 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	// Already loaded (boot KC) by the time Lilu runs.
 	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
-		arrsize(pathIOAcceleratorFamily2), {true}, {}, KernelPatcher::KextInfo::Unloaded},
+		arrsize(pathIOAcceleratorFamily2), {}, {}, KernelPatcher::KextInfo::Unloaded},
 };
 
 CRDriver *CRDriver::callback = nullptr;
@@ -3708,16 +3708,6 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 		diskLogStarted = true;
 }
 
-// The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
-// stall state, the PM4 and SDMA ring pointers, CP_ME_CNTL, RLC, VM fault status/address; and the PM4 ring before RPTR.
-static const uint16_t hangRegs[] {0x2004, 0x2002, 0x2005, 0x0394, 0x0393, 0x21A0, 0x219C, 0x219D, 0x219E, 0x219F,
-	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F};
-static struct {
-	uint64_t ms;
-	uint32_t arg, regs[arrsize(hangRegs)], rptr, ring[48];
-	bool taken;
-} hangSnap;
-
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
@@ -3864,13 +3854,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (gpuMmio && smuLoadOk() && !stallPanicOff) {
 			uint32_t rptr = gpuMmio[0x21C0], wptr = gpuMmio[0x3045];
 			if (rptr != wptr && rptr == stallRptr) {
-				if (hangSnap.taken && stallTicks < 100) {
-					// Apple driver is actively performing GPU hang recovery/reset (give it up to 50 s):
-					stallTicks++;
-				} else if (++stallTicks == 20) {
+				if (++stallTicks == 20)
 					self->panicReport(t, now, "CarrizoRed: the GPU stopped executing commands (GFX ring read pointer stuck "
 						"for 10 s with work queued).");
-				}
 			} else {
 				stallTicks = 0;
 				stallRptr = rptr;
@@ -4418,8 +4404,6 @@ namespace {
 		{"__ZN30AMDRadeonX4000_AMDAccelChannel22resetHardwareAndReplayEv", "uc.replay", InAccel, false, false, 0},
 	};
 
-	static void onAccelStartDone();
-
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
 	// prints them, and panics naming the function if a call hasn't returned after 10 s. "sync" stages also print
 	// directly and pause, because an instant whole-machine hang leaves the watcher no chance.
@@ -4494,8 +4478,6 @@ namespace {
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
-		if (!strcmp(stages[N].name, "accel.start"))
-			onAccelStartDone();
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
@@ -4638,58 +4620,16 @@ static void selectAccelLayouts() {
 	}
 }
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
-static void *savedRootVmm;
-static void *savedRootVmmPtr20;
-static void *savedRootVmmPtr28;
-static void *savedRootVmmPtr30;
-static void *savedRootVmmPtr38;
-static void *savedTptMgr;
-static void *savedVmm;
-static void *savedVmmPtr20;
-static void *savedVmmPtr28;
 
-static void onAccelStartDone() {
-	if (accelHardware) {
-		auto *hwBytes = static_cast<uint8_t *>(accelHardware);
-		savedRootVmm = *reinterpret_cast<void **>(hwBytes + 0x450);
-		savedTptMgr = *reinterpret_cast<void **>(hwBytes + 0x458);
-		savedVmm = savedRootVmm;
-		if (savedRootVmm) {
-			const auto *vq = static_cast<const uint64_t *>(savedRootVmm);
-			savedRootVmmPtr20 = reinterpret_cast<void *>(vq[4]); // +0x20 sDMA engine
-			savedRootVmmPtr28 = reinterpret_cast<void *>(vq[5]); // +0x28 VMPT channel
-			savedRootVmmPtr30 = reinterpret_cast<void *>(vq[6]); // +0x30 event machine
-			savedRootVmmPtr38 = reinterpret_cast<void *>(vq[7]); // +0x38 cmd buf pool
-			savedVmmPtr20 = savedRootVmmPtr20;
-			savedVmmPtr28 = savedRootVmmPtr28;
-			diskLogEvent("accel.start done: savedRootVmm=%p ptr20=%p ptr28=%p ptr30=%p ptr38=%p",
-				savedRootVmm, savedRootVmmPtr20, savedRootVmmPtr28, savedRootVmmPtr30, savedRootVmmPtr38);
-		}
-	}
-}
-
-static void ensureVmmAndCtxSdma(void *vmm, void *ctx, const char *when) {
-	(void)ctx;
-	if (vmm && vmm != savedTptMgr) {
-		savedVmm = vmm;
-		auto *vb = static_cast<uint8_t *>(vmm);
-		void **p20 = reinterpret_cast<void **>(vb + 0x20);
-		void **p28 = reinterpret_cast<void **>(vb + 0x28);
-		void **p30 = reinterpret_cast<void **>(vb + 0x30);
-		void **p38 = reinterpret_cast<void **>(vb + 0x38);
-		bool rep = false;
-		if (!*p20 && savedRootVmmPtr20) { *p20 = savedRootVmmPtr20; rep = true; }
-		if (!*p28 && savedRootVmmPtr28) { *p28 = savedRootVmmPtr28; rep = true; }
-		if (!*p30 && savedRootVmmPtr30) { *p30 = savedRootVmmPtr30; rep = true; }
-		if (!*p38 && savedRootVmmPtr38) { *p38 = savedRootVmmPtr38; rep = true; }
-		if (rep) {
-			diskLogEvent("ensureVmmAndCtxSdma@%s: repaired vmm=%p (+20=%p +28=%p +30=%p +38=%p)",
-				when, vmm, *p20, *p28, *p30, *p38);
-		}
-		savedVmmPtr20 = *p20 ? *p20 : savedRootVmmPtr20;
-		savedVmmPtr28 = *p28 ? *p28 : savedRootVmmPtr28;
-	}
-}
+// The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
+// stall state, the PM4 and SDMA ring pointers, CP_ME_CNTL, RLC, VM fault status/address; and the PM4 ring before RPTR.
+static const uint16_t hangRegs[] {0x2004, 0x2002, 0x2005, 0x0394, 0x0393, 0x21A0, 0x219C, 0x219D, 0x219E, 0x219F,
+	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F};
+static struct {
+	uint64_t ms;
+	uint32_t arg, regs[arrsize(hangRegs)], rptr, ring[48];
+	bool taken;
+} hangSnap;
 
 static void snapshotHang(uint32_t arg) {
 	auto *mmio = gpuMmio;
@@ -4793,19 +4733,11 @@ static const char *accelGuardMissLast;
 static uint64_t wrapEndVMPTUpdate(void *that) {
 	if (!that)
 		return 0;
-	if (that != savedTptMgr) {
-		savedVmm = that;
-		ensureVmmAndCtxSdma(that, nullptr, "endVMPTUpdate");
-	}
 	auto *self = static_cast<uint8_t *>(that);
 	auto &count = *reinterpret_cast<int32_t *>(self + 0x3C);
 	if (--count != 0)
 		return 0;
 	auto *channel = *reinterpret_cast<void **>(self + 0x28);
-	if (!channel && savedRootVmmPtr28) {
-		channel = savedRootVmmPtr28;
-		*reinterpret_cast<void **>(self + 0x28) = savedRootVmmPtr28;
-	}
 	if (!channel)
 		return 0;
 	if (!vfunc<uint32_t (*)(void *)>(channel, 0x140)(channel))
@@ -4868,8 +4800,6 @@ static mach_vm_address_t orgAssignVMID;
 static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *channel, void **event, bool *pBool) {
 	static uint32_t assignCalls;
 	uint32_t aNum = ++assignCalls;
-	if (that)
-		ensureVmmAndCtxSdma(that, ctx, "assignVMID");
 
 	auto *vb = static_cast<uint8_t *>(that);
 
@@ -4927,77 +4857,6 @@ static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *chan
 			aNum, that, ctx, channel, engine, vmid, newlyAssigned);
 
 	return 1; // true
-}
-
-static mach_vm_address_t orgCommitIntoGPUPageTable;
-static uint64_t wrapCommitIntoGPUPageTable(void *that) {
-	if (!that)
-		return 0;
-	auto *self = static_cast<uint8_t *>(that);
-	void *task = *reinterpret_cast<void **>(self + 0x90);
-	uint8_t hasVM = task ? *reinterpret_cast<uint8_t *>(static_cast<uint8_t *>(task) + 0x268) : 0;
-	void *vmCtx = (task && hasVM == 1) ? *reinterpret_cast<void **>(static_cast<uint8_t *>(task) + 0x260) : nullptr;
-	if (vmCtx) {
-		auto *ctxBytes = static_cast<uint8_t *>(vmCtx);
-		void *vmm = *reinterpret_cast<void **>(ctxBytes + 0x18);
-		if (vmm && vmm != savedTptMgr) {
-			savedVmm = vmm;
-			ensureVmmAndCtxSdma(vmm, vmCtx, "commitIntoGPUPageTable");
-		}
-	}
-	uint64_t ret = orgCommitIntoGPUPageTable ?
-		FunctionCast(wrapCommitIntoGPUPageTable, orgCommitIntoGPUPageTable)(that) : 0;
-	uint32_t ret32 = static_cast<uint32_t>(ret);
-	bool ok = (ret32 & 0xFF) != 0;
-	if (hasVM == 1 && !ok) {
-		// Framebuffer / Resource wire-down fallback: prevent WindowServer from looping/stalling
-		ret = 1;
-		ret32 = 1;
-		ok = true;
-	}
-	static uint32_t commitCalls;
-	if (++commitCalls <= 16) {
-		uint64_t gpuVA = *reinterpret_cast<uint64_t *>(self + 0x98);
-		diskLogEvent("commitIntoGPUPageTable #%u: that=%p ret=0x%x (ok=%d va=0x%llx hasVM=%u)",
-			commitCalls, that, ret32, ok, gpuVA, hasVM);
-	}
-	return ret;
-}
-
-static mach_vm_address_t orgReleaseFromGPUPageTable;
-static uint64_t wrapReleaseFromGPUPageTable(void *that) {
-	if (!that)
-		return 0;
-	static uint32_t releaseCalls;
-	if (++releaseCalls <= 16) {
-		auto *self = static_cast<uint8_t *>(that);
-		uint64_t gpuVA = *reinterpret_cast<uint64_t *>(self + 0x98);
-		diskLogEvent("releaseFromGPUPageTable #%u (%p): va=0x%llx", releaseCalls, that, gpuVA);
-	}
-	return orgReleaseFromGPUPageTable ?
-		FunctionCast(wrapReleaseFromGPUPageTable, orgReleaseFromGPUPageTable)(that) : 0;
-}
-
-static mach_vm_address_t orgAddToPageTableUpdateBarrier;
-static void wrapAddToPageTableUpdateBarrier(void *that, void *event) {
-	static uint32_t barrierCalls;
-	if (++barrierCalls <= 16)
-		diskLogEvent("addToPageTableUpdateBarrier #%u: bypassed that=%p event=%p", barrierCalls, that, event);
-}
-
-static mach_vm_address_t orgSetDMAUpdates;
-static uint64_t wrapSetDMAUpdates(void *that, void *eventMachine, void *cmdBufPool) {
-	if (that) {
-		auto *ctx = static_cast<uint8_t *>(that);
-		if (eventMachine)
-			*reinterpret_cast<void **>(ctx + 0x30) = eventMachine;
-		if (cmdBufPool)
-			*reinterpret_cast<void **>(ctx + 0x38) = cmdBufPool;
-	}
-	static uint32_t setDmaCalls;
-	if (++setDmaCalls <= 16)
-		diskLogEvent("setDMAUpdates #%u: ctx=%p evMach=%p pool=%p -> ok", setDmaCalls, that, eventMachine, cmdBufPool);
-	return 1;
 }
 
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
@@ -5203,18 +5062,6 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
 			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
 	}
-	route("__ZN32AMDRadeonX4000_AMDAccelMemoryMap22commitIntoGPUPageTableEv",
-		reinterpret_cast<mach_vm_address_t>(wrapCommitIntoGPUPageTable), orgCommitIntoGPUPageTable, nullptr, 0,
-		"commitIntoGPUPageTable");
-	route("__ZN32AMDRadeonX4000_AMDAccelMemoryMap23releaseFromGPUPageTableEv",
-		reinterpret_cast<mach_vm_address_t>(wrapReleaseFromGPUPageTable), orgReleaseFromGPUPageTable, nullptr, 0,
-		"releaseFromGPUPageTable");
-	route("__ZN29AMDRadeonX4000_AMDHWVMContext27addToPageTableUpdateBarrierEP12IOAccelEvent",
-		reinterpret_cast<mach_vm_address_t>(wrapAddToPageTableUpdateBarrier), orgAddToPageTableUpdateBarrier, nullptr, 0,
-		"addToPageTableUpdateBarrier");
-	route("__ZN29AMDRadeonX4000_AMDHWVMContext13setDMAUpdatesEP20IOAccelEventMachine2P36AMDRadeonX4000_IAMDCommandBufferPool",
-		reinterpret_cast<mach_vm_address_t>(wrapSetDMAUpdates), orgSetDMAUpdates, nullptr, 0,
-		"setDMAUpdates");
 	KernelPatcher::RouteRequest bypassRequests[] {
 		{"__ZN31AMDRadeonX4000_AMDAccelResource13zeroVidMemoryEP12IOAccelEventy",
 			reinterpret_cast<mach_vm_address_t>(wrapZeroVidMemory)},
@@ -5474,15 +5321,6 @@ uint64_t CRDriver::wrapSetupHWCapabilities(void *that) {
 
 uint64_t CRDriver::wrapUpdatePTEsDMA(void *that, uint64_t dst, uint64_t count, uint64_t addr, uint64_t flags,
 	uint64_t incr) {
-	if (that) {
-		void *vmm = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x18);
-		ensureVmmAndCtxSdma(vmm, that, "updatePTEsDMA");
-	}
-	bool isApu = callback && (callback->family == ChipFamily::Stoney || callback->family == ChipFamily::Carrizo);
-	if (!that || isApu || !*reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x38) ||
-		!*reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x30)) {
-		return 1;
-	}
 	if ((flags & 1) && !(flags & 2))  // valid, not system memory
 		addr = vmToPhysical(addr, 'D');
 	return FunctionCast(wrapUpdatePTEsDMA, callback->orgUpdatePTEsDMA)(that, dst, count, addr, flags, incr);
