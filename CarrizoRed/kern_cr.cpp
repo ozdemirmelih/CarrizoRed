@@ -4624,7 +4624,8 @@ static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for t
 // The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
 // stall state, the PM4 and SDMA ring pointers, CP_ME_CNTL, RLC, VM fault status/address; and the PM4 ring before RPTR.
 static const uint16_t hangRegs[] {0x2004, 0x2002, 0x2005, 0x0394, 0x0393, 0x21A0, 0x219C, 0x219D, 0x219E, 0x219F,
-	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F};
+	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F,
+	0x0504, 0x0505, 0x050C, 0x050D, 0x054F, 0x0550, 0x0557, 0x0558, 0x055F, 0x0560};
 static struct {
 	uint64_t ms;
 	uint32_t arg, regs[arrsize(hangRegs)], rptr, ring[48];
@@ -4850,11 +4851,74 @@ static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *chan
 	if (event)
 		*event = nullptr;
 
-	// 4. Notify context that VMID is assigned (vtable offset 0x170 on ctx)
+	// 4. Program GMC 8.0 MMU hardware registers for this VMID
+	if (gpuMmio && vmid > 0 && vmid < 16) {
+		uint64_t rawPdb = 0;
+		if (ctx) {
+			uintptr_t *vt = *reinterpret_cast<uintptr_t **>(ctx);
+			if (vt && (uintptr_t)vt >= 0xffffff8000000000ULL) {
+				uintptr_t fn158 = vt[0x158 / 8];
+				if (fn158 >= 0xffffff8000000000ULL) {
+					rawPdb = vfunc<uint64_t (*)(void *)>(ctx, 0x158)(ctx);
+				}
+			}
+			if (!rawPdb) {
+				const auto *cq = reinterpret_cast<const uint64_t *>(ctx);
+				for (size_t i = 1; i < 32; i++) {
+					uint64_t val = cq[i];
+					if (val >= vmFbStart && val <= vmFbEnd) {
+						rawPdb = val;
+						break;
+					}
+				}
+			}
+			if (aNum <= 4) {
+				const auto *cq = reinterpret_cast<const uint64_t *>(ctx);
+				diskLogEvent("assignVMID #%u ctx: [0]=%llx [18]=%llx [20]=%llx [28]=%llx [30]=%llx [80]=%llx [88]=%llx [90]=%llx [98]=%llx",
+					aNum, cq[0], cq[3], cq[4], cq[5], cq[6], cq[16], cq[17], cq[18], cq[19]);
+			}
+		}
+
+		uint64_t physPdb = rawPdb ? vmToPhysical(rawPdb, 'P') : 0;
+		if (!physPdb && gpuMmio[0x54F]) {
+			physPdb = static_cast<uint64_t>(gpuMmio[0x54F]) << 12;
+		}
+
+		uint32_t pfn = static_cast<uint32_t>((physPdb >> 12) & 0xFFFFFFFF);
+
+		// Page Table Base Address
+		if (vmid < 8)
+			gpuMmio[0x54F + vmid] = pfn;
+		else
+			gpuMmio[0x50E + vmid - 8] = pfn;
+
+		// VM Context Control (CNTL: 0x504 + vmid)
+		uint32_t cntl0 = gpuMmio[0x504];
+		gpuMmio[0x504 + vmid] = (cntl0 ? cntl0 : 0x0c0b8603) | 1U;
+
+		// VM Context Control 2 (CNTL2: 0x50C + vmid)
+		uint32_t cntl2 = gpuMmio[0x50C];
+		gpuMmio[0x50C + vmid] = cntl2 ? cntl2 : 2U;
+
+		// Page Table Range (Start = 0, End = Context 0 end or max PFN)
+		gpuMmio[0x557 + vmid] = 0;
+		uint32_t end0 = gpuMmio[0x55F];
+		gpuMmio[0x55F + vmid] = end0 ? end0 : 0x00FFFFFF;
+
+		// Invalidate TLB for this VMID
+		gpuMmio[0x51E] = (1U << vmid);
+
+		if (aNum <= 32) {
+			diskLogEvent("assignVMID #%u: vmid=%u PDB raw=0x%llx phys=0x%llx pfn=0x%x cntl=0x%x",
+				aNum, vmid, rawPdb, physPdb, pfn, gpuMmio[0x504 + vmid]);
+		}
+	}
+
+	// 5. Notify context that VMID is assigned (vtable offset 0x170 on ctx)
 	if (ctx)
 		vfunc<void (*)(void *, uint32_t)>(ctx, 0x170)(ctx, engine);
 
-	// 5. Set switch flag if requested
+	// 6. Set switch flag if requested
 	if (pBool)
 		*pBool = newlyAssigned;
 
