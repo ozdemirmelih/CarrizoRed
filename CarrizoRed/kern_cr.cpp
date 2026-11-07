@@ -842,7 +842,7 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	[KextAgdp] = {"com.apple.driver.AppleGraphicsDevicePolicy", pathAgdp, arrsize(pathAgdp), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 	// Already loaded (boot KC) by the time Lilu runs.
-	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
+	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
 		arrsize(pathIOAcceleratorFamily2), {}, {}, KernelPatcher::KextInfo::Unloaded},
 };
@@ -3867,7 +3867,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Not while SCLK DPM runs: nvram183/188 froze with it on (both without a report, so the CPU stopped too), and
 		// these SMU register reads every 500 ms are the one thing we do that Linux doesn't (it reads them on request).
 		bool smu8 = self->family == ChipFamily::Stoney || self->family == ChipFamily::Carrizo;
-		if (smu8 && !sclkDpmRunning())
+		if (smu8 && !sclkDpmRunning() && !checkKernelArgument("-crnosampleclock"))
 			sampleGpuClock();
 		if (smu8)
 			watchSmuMailbox();
@@ -4788,12 +4788,18 @@ static uint64_t wrapInitFillRegions(void *that) {
 	return 0;
 }
 
+static mach_vm_address_t orgResourcePrepare;
 static uint64_t wrapResourcePrepare(void *that) {
 	static uint32_t prepCalls;
 	uint32_t pNum = ++prepCalls;
+	uint64_t ret = 0;
+	if (orgResourcePrepare && that)
+		ret = FunctionCast(wrapResourcePrepare, orgResourcePrepare)(that);
+	else
+		ret = 1;
 	if (pNum <= 32)
-		diskLogEvent("resource::prepare #%u: that=%p -> ok (bypassed)", pNum, that);
-	return 1;
+		diskLogEvent("resource::prepare #%u: that=%p -> ret=0x%llx", pNum, that, ret);
+	return ret;
 }
 
 static mach_vm_address_t orgAssignVMID;
@@ -5071,14 +5077,32 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapPageoff)},
 		{"__ZN31AMDRadeonX4000_AMDAccelResource15initFillRegionsEv",
 			reinterpret_cast<mach_vm_address_t>(wrapInitFillRegions)},
-		{"__ZN31AMDRadeonX4000_AMDAccelResource7prepareEv",
-			reinterpret_cast<mach_vm_address_t>(wrapResourcePrepare)},
 	};
 	for (auto &req : bypassRequests) {
 		if (patcher.routeMultipleLong(index, &req, 1, slide, size)) {
 			diskLogEvent("accel: routed %s successfully", req.symbol);
 		} else {
 			diskLogEvent("accel: failed to route %s (error %d)", req.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+
+	KernelPatcher::RouteRequest requestPrepare {
+		"__ZN31AMDRadeonX4000_AMDAccelResource7prepareEv",
+		reinterpret_cast<mach_vm_address_t>(wrapResourcePrepare),
+		orgResourcePrepare
+	};
+	if (routeChecked(patcher, index, requestPrepare, slide, size)) {
+		diskLogEvent("accel: routed prepareEv successfully");
+	} else {
+		KernelPatcher::RouteRequest requestPrepareLong {
+			"__ZN31AMDRadeonX4000_AMDAccelResource7prepareEv",
+			reinterpret_cast<mach_vm_address_t>(wrapResourcePrepare)
+		};
+		if (patcher.routeMultipleLong(index, &requestPrepareLong, 1, slide, size)) {
+			diskLogEvent("accel: routed prepareEv (long) successfully");
+		} else {
+			diskLogEvent("accel: failed to route prepareEv (error %d)", patcher.getError());
 			patcher.clearError();
 		}
 	}
@@ -7406,7 +7430,7 @@ bool CRDriver::isGpuFunction(IOPCIDevice *device) {
 }
 
 void CRDriver::patchPci(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	keepGpuOn = checkKernelArgument("-crkeepgpuon");
+	keepGpuOn = !checkKernelArgument("-crnokeepgpuon");
 	if (checkKernelArgument("-crnopcitrace") && !keepGpuOn)
 		return;
 	KernelPatcher::RouteRequest requests[] {
@@ -7456,6 +7480,7 @@ IOReturn CRDriver::wrapPciSetPCIPowerState(IOPCIDevice *that, uint8_t state, uin
 	if (keepGpuOn && fn == 0 && state < PciOnState) {
 		pmLog(false, "pci.setPCIPowerState BLOCKED", state, "PCI fn%u setPCIPowerState(%u, 0x%x) BLOCKED (-crkeepgpuon)",
 			fn, state, options);
+		diskLogEvent("pci fn%u setPCIPowerState(%u, 0x%x) BLOCKED (keepGpuOn)", fn, state, options);
 		return kIOReturnSuccess;
 	}
 	pmLog(false, "pci.setPCIPowerState", state, "=> PCI fn%u setPCIPowerState(%u, 0x%x)", fn, state, options);
@@ -7473,6 +7498,7 @@ IOReturn CRDriver::wrapBridgeSetDevicePowerState(IOService *that, IOPCIDevice *d
 	if (keepGpuOn && fn == 0 && newState < PciOnState) {
 		pmLog(false, "bridge.setDevicePowerState BLOCKED", static_cast<uint32_t>(newState),
 			"PCI fn%u setDevicePowerState(%lu -> %lu, 0x%x) BLOCKED (-crkeepgpuon)", fn, prevState, newState, options);
+		diskLogEvent("pci fn%u bridgeSetDevicePowerState(%lu -> %lu) BLOCKED (keepGpuOn)", fn, prevState, newState);
 		return kIOReturnSuccess;
 	}
 	pmLog(false, "bridge.setDevicePowerState", static_cast<uint32_t>(newState),
