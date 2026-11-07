@@ -352,6 +352,12 @@ static void checkLiveHwlibs(void *hardware);
 // SX_PS_DOWNCONVERT, SX_BLEND_OPT_EPSILON, SX_BLEND_OPT_CONTROL and SX_MRT0-7_BLEND_OPT for every draw. Apple's Polaris
 // Metal driver has never heard of them (Polaris has no RB+), so on Stoney they keep the clear-state defaults, and
 // blend optimisations left on with arbitrary settings would break alpha-blended drawing (the icons and Dock render
+static uint32_t crVramMbOverride, crFbOffsetOverride;
+
+static inline uint32_t effectiveFbOffset(volatile uint32_t *mmio) {
+	return crFbOffsetOverride ? crFbOffsetOverride : (mmio ? (mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) : 0);
+}
+
 // wrong while opaque windows are fine). The clear-state buffer (RLC_CSIB_ADDR_LO/HI, RLC_CSIB_LENGTH = 0xECA2-0xECA4,
 // in VRAM) holds the context registers' defaults that CLEAR_STATE loads: record what it sets for 0x28750-0x2877C
 // (context register indices 0x1D4-0x1DF) and set SX_BLEND_OPT_CONTROL (0x1D6) to every MRT's colour and alpha
@@ -377,7 +383,7 @@ static void fixRbPlus(volatile uint32_t *mmio, bool stoney) {
 	uint64_t fbTop = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
 	if (mc < fbBase || mc + dwords * 4 > fbTop)
 		return;
-	uint64_t phys = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + (mc - fbBase);
+	uint64_t phys = (static_cast<uint64_t>(effectiveFbOffset(mmio)) << 22) + (mc - fbBase);
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, dwords * 4, kIODirectionInOut);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	if (map) {
@@ -4691,7 +4697,7 @@ static T vfunc(void *object, size_t offset) {
 static bool vmFixInit() {
 	if (vmFixReady || !vmFixOn || !gpuMmio)
 		return vmFixReady;
-	uint32_t location = gpuMmio[0x809], offset = gpuMmio[0x81A];  // MC_VM_FB_LOCATION, MC_VM_FB_OFFSET
+	uint32_t location = gpuMmio[0x809], offset = effectiveFbOffset(gpuMmio);  // MC_VM_FB_LOCATION, MC_VM_FB_OFFSET
 	vmFbStart = static_cast<uint64_t>(location & 0xFFFF) << 24;
 	vmFbEnd = static_cast<uint64_t>((location >> 16) & 0xFFFF) << 24 | 0xFFFFFF;
 	vmCarveout = static_cast<uint64_t>(offset & 0x3FFFF) << 22;
@@ -4803,6 +4809,14 @@ static uint64_t wrapResourcePrepare(void *that) {
 	return ret;
 }
 
+static void wrapAddToPageTableUpdateBarrier(void *that, void *event) {
+	// Bypassed on APU UMA: AMDHWVMContext lacks discrete Polaris event machine/ring pointer,
+	// dereferencing NULL at +0x1d (CR2 = 0x0).
+	static uint32_t bNum;
+	if (++bNum <= 16)
+		diskLogEvent("addToPageTableUpdateBarrier #%u: that=%p ev=%p -> bypassed", bNum, that, event);
+}
+
 static mach_vm_address_t orgAssignVMID;
 static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *channel, void **event, bool *pBool) {
 	static uint32_t assignCalls;
@@ -4900,10 +4914,12 @@ static uint64_t wrapAssignVMID(void *that, void *ctx, uint32_t &vmid, void *chan
 		uint32_t cntl2 = gpuMmio[0x50C];
 		gpuMmio[0x50C + vmid] = cntl2 ? cntl2 : 2U;
 
-		// Page Table Range (Start = 0, End = Context 0 end or max PFN)
+		// Page Table Range: Context 1 user-space VA spans from 0x400000000 (16 GB)
+		// up to 0x2400000000 (144 GB). Context 1 aperture end (0x55F + vmid) must cover
+		// the full 40-bit address space (0x0FFFFFFF), never clamped to Context 0 end (0x4FFFF = 1.28 GB)
+		// which drops user IB execution packets.
 		gpuMmio[0x557 + vmid] = 0;
-		uint32_t end0 = gpuMmio[0x55F];
-		gpuMmio[0x55F + vmid] = end0 ? end0 : 0x00FFFFFF;
+		gpuMmio[0x55F + vmid] = 0x0FFFFFFF;
 
 		// Invalidate TLB for this VMID
 		gpuMmio[0x51E] = (1U << vmid);
@@ -5189,6 +5205,17 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			diskLogEvent("accel: failed to route assignVMID (error %d)", patcher.getError());
 			patcher.clearError();
 		}
+	}
+
+	KernelPatcher::RouteRequest requestBarrier {
+		"__ZN29AMDRadeonX4000_AMDHWVMContext27addToPageTableUpdateBarrierEP12IOAccelEvent",
+		reinterpret_cast<mach_vm_address_t>(wrapAddToPageTableUpdateBarrier)
+	};
+	if (patcher.routeMultipleLong(index, &requestBarrier, 1, slide, size)) {
+		diskLogEvent("accel: routed addToPageTableUpdateBarrier successfully");
+	} else {
+		diskLogEvent("accel: failed to route addToPageTableUpdateBarrier (error %d)", patcher.getError());
+		patcher.clearError();
 	}
 }
 
@@ -7190,7 +7217,13 @@ uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
 	int flags = regAccess(RegRead, offset, 1, 0);
 	if (flags & RegBlocked)
 		return 0;
-	return regReadDone(flags, FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset));
+	uint32_t val = FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
+	uint32_t dword = offset >> 2;
+	if (dword == Reg::CONFIG_MEMSIZE && crVramMbOverride)
+		val = crVramMbOverride;
+	else if (dword == Reg::MC_VM_FB_OFFSET && crFbOffsetOverride)
+		val = crFbOffsetOverride;
+	return regReadDone(flags, val);
 }
 
 uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
@@ -7221,7 +7254,13 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 	int flags = regAccess(RegRead, offset, 0, 0);
 	if (flags & RegBlocked)
 		return 0;
-	return regReadDone(flags, FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset));
+	uint32_t val = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
+	uint32_t dword = offset >> 2;
+	if (dword == Reg::CONFIG_MEMSIZE && crVramMbOverride)
+		val = crVramMbOverride;
+	else if (dword == Reg::MC_VM_FB_OFFSET && crFbOffsetOverride)
+		val = crFbOffsetOverride;
+	return regReadDone(flags, val);
 }
 
 // Line buffer size. LB_MEMORY_CTRL (pipe 0 at dword 0x1AC1, +0x200 per pipe on DCE 11.0): Apple writes
@@ -8654,7 +8693,49 @@ void CRDriver::probeMMIO() {
 
 	uint64_t fbBase = static_cast<uint64_t>(fbLocation & 0xFFFF) << 24;
 	uint64_t fbTop = (static_cast<uint64_t>(fbLocation >> 16) << 24) | 0xFFFFFF;
-	uint64_t carveoutPhys = static_cast<uint64_t>(fbOffset) << 22;
+	uint64_t carveoutPhys = static_cast<uint64_t>(fbOffset & 0x3FFFF) << 22;
+
+	uint32_t expandMb = 0;
+	bool parsedVram = PE_parse_boot_argn("crvrammb", &expandMb, sizeof(expandMb)) ||
+	                  PE_parse_boot_argn("-crvrammb", &expandMb, sizeof(expandMb));
+	if (!parsedVram && !checkKernelArgument("-crnovramexpand") && memSize < 256) {
+		expandMb = 256;
+	}
+	if (expandMb > memSize && expandMb <= 512 && (expandMb & 0xF) == 0 &&
+		carveoutPhys >= ((static_cast<uint64_t>(expandMb - memSize)) << 20)) {
+		uint64_t oldBytes = static_cast<uint64_t>(memSize) << 20;
+		uint64_t newBytes = static_cast<uint64_t>(expandMb) << 20;
+		uint64_t newCarveoutPhys = (carveoutPhys + oldBytes) - newBytes;
+		uint32_t newFbOffset = static_cast<uint32_t>(newCarveoutPhys >> 22);
+		uint32_t base16M = fbLocation & 0xFFFF;
+		uint32_t newTop16M = base16M + (expandMb >> 4) - 1;
+		uint32_t newFbLoc = (newTop16M << 16) | base16M;
+
+		mmio[Reg::MC_VM_FB_OFFSET] = newFbOffset;
+		mmio[Reg::MC_VM_FB_LOCATION] = newFbLoc;
+		mmio[Reg::CONFIG_MEMSIZE] = expandMb;
+		crVramMbOverride = expandMb;
+		crFbOffsetOverride = newFbOffset;
+		memSize = expandMb;
+		fbLocation = newFbLoc;
+		fbOffset = newFbOffset;
+		fbTop = (static_cast<uint64_t>(newTop16M) << 24) | 0xFFFFFF;
+		carveoutPhys = newCarveoutPhys;
+		SYSLOG("cr", "crvrammb: expanded UMA carve-out to %u MB at phys 0x%llX (FB_OFFSET 0x%X, FB_LOC 0x%08X)",
+			memSize, carveoutPhys, newFbOffset, newFbLoc);
+
+		// Zero initial scanout area safely to eliminate white static/garbage on boot
+		size_t zeroBytes = (newBytes < (4ULL << 20)) ? newBytes : (4ULL << 20);
+		auto *desc = IOMemoryDescriptor::withPhysicalAddress(newCarveoutPhys, zeroBytes, kIODirectionInOut);
+		if (desc) {
+			auto *map = desc->map();
+			if (map) {
+				memset(reinterpret_cast<void *>(map->getVirtualAddress()), 0, zeroBytes);
+				OSSafeReleaseNULL(map);
+			}
+			OSSafeReleaseNULL(desc);
+		}
+	}
 
 	SYSLOG("cr", "UMA carve-out %u MB at system 0x%llX, GPU FB range 0x%llX-0x%llX", memSize, carveoutPhys, fbBase,
 		fbTop);
@@ -8664,6 +8745,8 @@ void CRDriver::probeMMIO() {
 	iGPU->setProperty("CarrizoRed,vram-mb", memSize, 32);
 	iGPU->setProperty("CarrizoRed,carveout-phys", carveoutPhys, 64);
 	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
+	iGPU->setProperty("VRAM,totalMB", static_cast<unsigned long long>(memSize), 32);
+	iGPU->setProperty("ATY,memsize", static_cast<unsigned long long>(memSize) << 20, 64);
 
 	initDisplayRegs();
 	relocateFb();
@@ -8721,6 +8804,8 @@ void CRDriver::relocateFb() {
 	SYSLOG("cr", "FB window moved from 0x%llX to 0: MC_VM_FB_LOCATION 0x%08X -> 0x%08X (reads 0x%08X), HDP base 0x%X",
 		base, location, moved, fbRelocReadback, hdp);
 	iGPU->setProperty("CarrizoRed,fb-relocated", fbRelocReadback == moved);
+	vmFixReady = false;
+	vmFixInit();
 }
 
 // Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
